@@ -3,41 +3,68 @@
 # sing-box 单端口 NAT 版: vless-reality(TCP) + tuic(UDP) 同端口 + vmess-ws 走 Argo 隧道
 # 免 root, 容器/翼龙友好: 自动读取 PTERODACTYL/SERVER_PORT 环境变量
 # 端口优先级: PORT > PTERODACTYL_SERVER_PORT > SERVER_PORT > 随机
+#
+# 用法(任选其一):
+#   1) bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh)
+#   2) curl -Ls "https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh?t=$(date +%s)" | bash
+#   3) bash sb_argo.sh   # 自举落地后本地直接运行, 断网也能跑
+#
+# 自举(NAT 机免 crontab):
+#   - 脚本自身 + 依赖(sing-box/cloudflared) + 凭据 全部落地工作目录
+#   - 凭据持久化在 sb_argo.env, 重启后复用, 节点链接不变
+#   - sing-box 前台 while-true 守护; cloudflared 后台循环守护, 挂掉自动重启并刷新链接
+#   - 容器/主机重启后执行: bash sb_argo.sh
 # 20261011-xxxx init: 基于 sb 系列, 单端口布局(TCP+UDP 同号), vmess-ws 交 Argo 不占本地端口
+# 20261011-1602 feat: 自举 — 管道执行自动落地脚本+依赖, 凭据持久化复用(链接不变), cloudflared 纳入守护, verbose 输出
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-MASQ_DOMAIN="www.iij.ad.jp"     # vless-reality 伪装站点
-TUIC_SNI="www.bing.com"         # tuic 自签证书 SNI
-CONF_JSON="sb-argo.json"
-CERT_PEM="sb-cert.pem"
-KEY_PEM="sb-key.pem"
-LINK_TXT="sb_argo_link.txt"
-SB_BIN="./sing-box"
-CFD_BIN="./cloudflared"
+WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
+SELF_FILE="${WORKDIR}/sb_argo.sh"
+CONF_JSON="${WORKDIR}/sb-argo.json"
+ENV_FILE="${WORKDIR}/sb_argo.env"
+CERT_PEM="${WORKDIR}/sb-cert.pem"
+KEY_PEM="${WORKDIR}/sb-key.pem"
+LINK_TXT="${WORKDIR}/sb_argo_link.txt"
+SB_BIN="${WORKDIR}/sing-box"
+CFD_BIN="${WORKDIR}/cloudflared"
+ARGO_LOG="${WORKDIR}/argo.log"
+RAW_BASE="https://raw.githubusercontent.com/szliyang/NAT-sing-box/main"
+SB_VER="1.10.7"
 ARGO_LOCAL_PORT="${ARGO_PORT:-8001}"
+MASQ_DOMAIN="www.iij.ad.jp"      # vless-reality 伪装站点
+TUIC_SNI="www.bing.com"          # tuic 自签证书 SNI
 
-# ========== 端口自动获取 ==========
+red()    { echo -e "\033[1;91m$1\033[0m"; }
+green()  { echo -e "\033[1;32m$1\033[0m"; }
+purple() { echo -e "\033[1;35m$1\033[0m"; }
+
+# ========== 端口: 只认显式环境变量, 随机值不参与凭据恢复 ==========
+ENV_PORT=""                      # 显式指定的端口(可空)
+PORT_SRC=""
 detect_port() {
-  if [[ -n "${PORT:-}" ]]; then
-    echo "$PORT"
-  elif [[ -n "${PTERODACTYL_SERVER_PORT:-}" ]]; then
-    echo "$PTERODACTYL_SERVER_PORT"
-  elif [[ -n "${SERVER_PORT:-}" ]]; then
-    echo "$SERVER_PORT"
-  else
-    shuf -i 10000-65535 -n 1
+  if [[ -n "${PORT:-}" ]]; then ENV_PORT="$PORT"; PORT_SRC="PORT"
+  elif [[ -n "${PTERODACTYL_SERVER_PORT:-}" ]]; then ENV_PORT="$PTERODACTYL_SERVER_PORT"; PORT_SRC="PTERODACTYL_SERVER_PORT"
+  elif [[ -n "${SERVER_PORT:-}" ]]; then ENV_PORT="$SERVER_PORT"; PORT_SRC="SERVER_PORT"
+  else ENV_PORT=""; PORT_SRC="随机"
   fi
 }
 
 get_server_ip() {
   [[ -n "${PTERODACTYL_SERVER_IP:-}" ]] && { echo "$PTERODACTYL_SERVER_IP"; return; }
   [[ -n "${SERVER_IP:-}" ]] && { echo "$SERVER_IP"; return; }
-  curl -4 -sm 5 https://api.ipify.org || echo "127.0.0.1"
+  local ip; ip="$(curl -4 -sm 5 https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "$ip" ]] && { echo "$ip"; return; }
+  # 断网回退: 沿用链接文件里上次的 IP, 避免降级成 127.0.0.1 覆盖已有链接
+  if [[ -s "$LINK_TXT" ]]; then
+    ip="$(sed -n 's#^vless://[^@]*@\([^:]*\):.*#\1#p' "$LINK_TXT" | head -n1)"
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+  fi
+  echo "127.0.0.1"
 }
 
-# ========== 架构与下载 ==========
+# ========== 架构 ==========
 detect_arch() {
   case "$(uname -m)" in
     x86_64|amd64) echo "amd64" ;;
@@ -47,43 +74,132 @@ detect_arch() {
   esac
 }
 
-red()    { echo -e "\e[1;91m$1\033[0m"; }
-green()  { echo -e "\e[1;32m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
-
-download_bins() {
-  local arch
-  arch=$(detect_arch)
-  if [[ ! -x "$SB_BIN" ]]; then
-    echo "📥 Downloading sing-box (${arch})..."
-    curl -sL -o sb.tgz "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-${arch}.tar.gz"
-    tar xzf sb.tgz "sing-box-1.10.7-linux-${arch}/sing-box" --strip-components=1
-    rm -f sb.tgz && chmod +x "$SB_BIN"
-  else
-    green "✅ sing-box 已存在"
+# ========== 自举1: 脚本自身落地(管道执行时本地没有本文件) ==========
+ensure_self() {
+  local rc=0
+  echo "📥 [自举] 拉取脚本自身: ${RAW_BASE}/sb_argo.sh"
+  curl -fL --connect-timeout 20 --retry 2 -o "${SELF_FILE}.tmp" \
+    "${RAW_BASE}/sb_argo.sh?t=$(date +%s)" || rc=$?
+  if [[ $rc -ne 0 || ! -s "${SELF_FILE}.tmp" ]]; then
+    rm -f "${SELF_FILE}.tmp"
+    if [[ -s "$SELF_FILE" ]]; then
+      echo "⚠️ [自举] 脚本下载失败(curl ${rc}), 沿用本地版本: ${SELF_FILE}"
+    else
+      red "⚠️ [自举] 脚本下载失败(curl ${rc}), 本次以管道副本运行; 建议将脚本手动保存到 ${SELF_FILE}"
+    fi
+    return 0
   fi
-  if [[ ! -x "$CFD_BIN" ]]; then
-    echo "📥 Downloading cloudflared (${arch})..."
-    curl -sL -o "$CFD_BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
-    chmod +x "$CFD_BIN"
+  if [[ -s "$SELF_FILE" ]] && cmp -s "${SELF_FILE}.tmp" "$SELF_FILE"; then
+    rm -f "${SELF_FILE}.tmp"
+    green "✅ [自举] 脚本已是最新: ${SELF_FILE} ($(wc -c < "$SELF_FILE" | tr -d ' ') bytes)"
   else
-    green "✅ cloudflared 已存在"
+    mv "${SELF_FILE}.tmp" "$SELF_FILE"
+    chmod +x "$SELF_FILE" || true
+    green "✅ [自举] 脚本已落地/更新: ${SELF_FILE} ($(wc -c < "$SELF_FILE" | tr -d ' ') bytes, 更新下次运行生效)"
+  fi
+}
+
+# ========== 自举2: 依赖落地(sing-box 必需, cloudflared 可选) ==========
+download_bins() {
+  local arch; arch="$(detect_arch)"
+  echo "🖥️  [依赖] 架构: $(uname -m) -> ${arch}"
+
+  if [[ -x "$SB_BIN" ]]; then
+    green "✅ [依赖] sing-box 已存在: $("$SB_BIN" version 2>/dev/null | head -n1)"
+  else
+    local url="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${arch}.tar.gz"
+    local rc=0
+    echo "📥 [依赖] 下载 sing-box v${SB_VER}: ${url}"
+    curl -fL --connect-timeout 20 --retry 2 -o "${WORKDIR}/sb.tgz" "$url" || rc=$?
+    if [[ $rc -ne 0 || ! -s "${WORKDIR}/sb.tgz" ]]; then
+      rm -f "${WORKDIR}/sb.tgz"
+      red "❌ [依赖] sing-box 下载失败(curl ${rc}), 本地亦无旧版可回退"
+      red "   常见原因: 无法访问 github.com; 手动诊断: curl -v ${url} -o /dev/null"
+      exit 1
+    fi
+    tar xzf "${WORKDIR}/sb.tgz" -C "$WORKDIR" --strip-components=1 "sing-box-${SB_VER}-linux-${arch}/sing-box"
+    rm -f "${WORKDIR}/sb.tgz"
+    chmod +x "$SB_BIN"
+    green "✅ [依赖] sing-box 落地: ${SB_BIN} ($("$SB_BIN" version 2>/dev/null | head -n1))"
+  fi
+
+  if [[ -x "$CFD_BIN" ]]; then
+    green "✅ [依赖] cloudflared 已存在: ${CFD_BIN}"
+  else
+    local url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
+    local rc=0
+    echo "📥 [依赖] 下载 cloudflared: ${url}"
+    curl -fL --connect-timeout 20 --retry 2 -o "${CFD_BIN}.tmp" "$url" || rc=$?
+    if [[ $rc -ne 0 || ! -s "${CFD_BIN}.tmp" ]]; then
+      rm -f "${CFD_BIN}.tmp"
+      red "⚠️ [依赖] cloudflared 下载失败(curl ${rc}), 跳过 Argo 隧道(不影响 vless/tuic)"
+      CFD_BIN=""
+      return 0
+    fi
+    mv "${CFD_BIN}.tmp" "$CFD_BIN"
+    chmod +x "$CFD_BIN"
+    green "✅ [依赖] cloudflared 落地: ${CFD_BIN} ($(wc -c < "$CFD_BIN" | tr -d ' ') bytes)"
+  fi
+}
+
+# ========== 自举3: 凭据持久化(重启复用, 节点链接不变) ==========
+save_env() {
+  cat > "$ENV_FILE" <<EOF
+# sb_argo 凭据持久化(自举复用, 勿外传)
+SB_PORT=${PORT}
+SB_UUID=${UUID}
+SB_TUIC_PASS=${TUIC_PASS}
+SB_REALITY_PRIV=${REALITY_PRIV}
+SB_REALITY_PUB=${REALITY_PUB}
+SB_SHORT_ID=${SHORT_ID}
+EOF
+  chmod 600 "$ENV_FILE" || true
+}
+
+load_credentials() {
+  if [[ -s "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    if [[ -n "$ENV_PORT" && "$ENV_PORT" != "$SB_PORT" ]]; then
+      echo "⚠️ [凭据] 端口变化: ${SB_PORT} -> ${ENV_PORT} (来源 ${PORT_SRC}), 以环境变量为准"
+      SB_PORT="$ENV_PORT"
+    fi
+    PORT="$SB_PORT"; UUID="$SB_UUID"; TUIC_PASS="$SB_TUIC_PASS"
+    REALITY_PRIV="$SB_REALITY_PRIV"; REALITY_PUB="$SB_REALITY_PUB"; SHORT_ID="$SB_SHORT_ID"
+    save_env
+    green "✅ [凭据] 复用 ${ENV_FILE} 已有凭据, 重启后节点链接不变"
+    echo "    PORT=${PORT} UUID=${UUID:0:8}... SHORT_ID=${SHORT_ID} TUIC_PASS=${TUIC_PASS:0:6}... pbk=${REALITY_PUB:0:8}..."
+  else
+    PORT="${ENV_PORT:-$(shuf -i 10000-65535 -n 1 2>/dev/null || echo $((RANDOM % 40000 + 20000)))}"
+    UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+    TUIC_PASS="$(openssl rand -hex 16)"
+    local keys; keys="$("$SB_BIN" generate reality-keypair)"
+    REALITY_PRIV="$(echo "$keys" | awk '/PrivateKey/{print $2}')"
+    REALITY_PUB="$(echo "$keys" | awk '/PublicKey/{print $2}')"
+    SHORT_ID="$(openssl rand -hex 4)"
+    save_env
+    green "✅ [凭据] 首次部署, 凭据已生成并持久化到 ${ENV_FILE} (权限 600)"
   fi
 }
 
 # ========== 证书(vless 不需要, tuic 自签) ==========
 generate_cert() {
-  [[ -f "$CERT_PEM" && -f "$KEY_PEM" ]] && { green "🔐 证书已存在"; return; }
+  if [[ -f "$CERT_PEM" && -f "$KEY_PEM" ]]; then
+    green "🔐 [证书] 已存在, 复用"
+    return
+  fi
+  echo "🔐 [证书] 生成 tuic 自签证书 (CN=${TUIC_SNI}, 365d)"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "$KEY_PEM" -out "$CERT_PEM" -subj "/CN=${TUIC_SNI}" -days 365 -nodes >/dev/null 2>&1
-  chmod 600 "$KEY_PEM"; chmod 644 "$CERT_PEM"
+  chmod 600 "$KEY_PEM" || true; chmod 644 "$CERT_PEM" || true
 }
 
 # ========== 生成配置 ==========
 generate_config() {
+  echo "📝 [配置] 生成 ${CONF_JSON} (vless+tuic :${PORT}, vmess-ws 127.0.0.1:${ARGO_LOCAL_PORT})"
   cat > "$CONF_JSON" <<EOF
 {
-  "log": {"level": "warn"},
+  "log": {"level": "info", "timestamp": true},
   "inbounds": [
     {
       "type": "vless",
@@ -133,28 +249,50 @@ EOF
 }
 
 # ========== Argo 隧道 ==========
-start_argo() {
+ARGO_HOST=""
+argo_start() {
+  if [[ -z "$CFD_BIN" ]]; then
+    ARGO_HOST="argodomain.pending"
+    return 0
+  fi
+  rm -f "$ARGO_LOG"                       # 清旧日志, 避免取到上次的临时域名
   if [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]]; then
-    nohup "$CFD_BIN" tunnel run --token "$ARGO_AUTH" >/dev/null 2>&1 &
-    green "✅ Argo 隧道(token)已启动: ${ARGO_DOMAIN}"
+    echo "🌐 [Argo] 启动固定隧道(token): ${ARGO_DOMAIN}"
+    nohup "$CFD_BIN" tunnel run --token "$ARGO_AUTH" --logfile "$ARGO_LOG" >/dev/null 2>&1 &
     ARGO_HOST="$ARGO_DOMAIN"
   else
+    echo "🌐 [Argo] 启动临时隧道: 127.0.0.1:${ARGO_LOCAL_PORT} -> trycloudflare.com"
     nohup "$CFD_BIN" tunnel --url "http://127.0.0.1:${ARGO_LOCAL_PORT}" \
-      --no-autoupdate --protocol http2 --logfile argo.log --loglevel info >/dev/null 2>&1 &
-    # 临时隧道域名需要等几秒从日志里取
+      --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info >/dev/null 2>&1 &
     local i
     for i in $(seq 1 30); do
-      ARGO_HOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' argo.log 2>/dev/null | head -n1 | sed 's#https://##')
+      ARGO_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | head -n1 | sed 's#https://##' || true)"
       [[ -n "$ARGO_HOST" ]] && break
       sleep 1
     done
-    if [[ -n "${ARGO_HOST:-}" ]]; then
-      green "✅ Argo 临时隧道已启动: ${ARGO_HOST}"
-    else
-      red "⚠️ Argo 临时隧道域名获取失败(不影响 vless/tuic), 可查看 argo.log"
-      ARGO_HOST="argodomain.pending"
-    fi
   fi
+  if [[ -n "$ARGO_HOST" ]]; then
+    green "✅ [Argo] 隧道已启动: ${ARGO_HOST} (日志: ${ARGO_LOG})"
+  else
+    red "⚠️ [Argo] 域名获取失败(不影响 vless/tuic), 可查看 ${ARGO_LOG}"
+    ARGO_HOST="argodomain.pending"
+  fi
+}
+
+# cloudflared 后台守护: 30s 巡检一次, 挂了自动重启隧道并刷新节点链接
+argo_watch() {
+  [[ -z "$CFD_BIN" ]] && return 0
+  (
+    while true; do
+      sleep 30
+      if ! pgrep -f "$CFD_BIN" >/dev/null 2>&1; then
+        echo "⚠️ [守护] cloudflared 不在运行, 重启 Argo 隧道..."
+        argo_start
+        generate_links "$(get_server_ip)"
+        purple "🔗 [守护] 节点链接已刷新(临时隧道域名已换): ${LINK_TXT}"
+      fi
+    done
+  ) &
 }
 
 # ========== 生成链接 ==========
@@ -165,37 +303,46 @@ vless://${UUID}@${ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=rea
 tuic://${UUID}:${TUIC_PASS}@${ip}:${PORT}?sni=${TUIC_SNI}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#sbargo-tuic
 vmess://$(echo "{ \"v\": \"2\", \"ps\": \"sbargo-vmess\", \"add\": \"${CFIP:-${ARGO_HOST}}\", \"port\": \"${CFPORT:-443}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ARGO_HOST}\", \"path\": \"/vmess-argo?ed=2048\", \"tls\": \"tls\", \"sni\": \"${ARGO_HOST}\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
 EOF
-  purple "🔗 节点链接已生成:"
+  purple "🔗 [链接] 节点链接已生成: ${LINK_TXT}"
   cat "$LINK_TXT"
 }
 
-# ========== 守护 ==========
+# ========== 守护: sing-box 前台运行(日志可见, 崩溃自动重启) ==========
 run_loop() {
-  echo "🚀 Starting sing-box (vless+tuic on :${PORT})..."
+  purple "🚀 [启动] sing-box 前台运行(vless+tuic :${PORT}), 日志直接输出, Ctrl+C 退出"
   while true; do
-    "$SB_BIN" run -c "$CONF_JSON" >/dev/null 2>&1 || true
-    echo "⚠️ sing-box crashed. Restarting in 5s..."
+    set +e
+    "$SB_BIN" run -c "$CONF_JSON"
+    local rc=$?
+    set -e
+    echo "⚠️ [守护] sing-box 退出(码 ${rc}), 5s 后重启..."
     sleep 5
   done
 }
 
 # ========== 主流程 ==========
 main() {
-  PORT=$(detect_port)
-  echo "✅ 端口: ${PORT} (vless=TCP, tuic=UDP, 同端口)"
-  UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
-  TUIC_PASS="$(openssl rand -hex 16)"
-  local keys=$("$SB_BIN" generate reality-keypair)
-  REALITY_PRIV=$(echo "$keys" | awk '/PrivateKey/{print $2}')
-  REALITY_PUB=$(echo "$keys" | awk '/PublicKey/{print $2}')
-  SHORT_ID=$(openssl rand -hex 4)
+  echo "📁 工作目录: ${WORKDIR}"
+  echo "🖥️  系统: $(uname -sm)"
+  detect_port
+  if [[ -n "$ENV_PORT" ]]; then
+    echo "✅ [端口] 环境指定: ${ENV_PORT} (来源 ${PORT_SRC})"
+  else
+    echo "🎲 [端口] 未指定, 复用已保存端口或随机分配"
+  fi
+  ensure_self
+  download_bins
+  load_credentials
+  echo "✅ [端口] 生效: ${PORT} (vless=TCP, tuic=UDP, 同端口)"
   generate_cert
   generate_config
-  start_argo
-  ip="$(get_server_ip)"
+  argo_start
+  argo_watch
+  local ip; ip="$(get_server_ip)"
+  echo "🌐 服务器 IP: ${ip}"
   generate_links "$ip"
+  green "💾 [自举] 脚本/依赖/凭据均已落地 ${WORKDIR}; NAT 机免 crontab, 重启后执行: bash ${SELF_FILE}"
   run_loop
 }
 
-download_bins
 main

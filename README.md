@@ -29,6 +29,7 @@ Telegram交流反馈群组：https://t.me/eooceu
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sing-box.sh)
 ```
+
 ## vps带端口变量运行示列(NAT机)
 PORT=开放的端口 确保后面有3个端口可用
 ```
@@ -39,8 +40,9 @@ PORT=你的端口 bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT
 单端口布局: vless-reality(TCP) + tuic(UDP) 共用同一端口, vmess-ws 走 Argo 隧道不占本地端口。
 免 root, 自动读取翼龙注入的 `PTERODACTYL_SERVER_PORT`/`SERVER_PORT`, 也可用 `PORT` 变量指定。
 Argo 支持 `ARGO_AUTH`+`ARGO_DOMAIN`(固定域名 token) 或默认临时隧道(trycloudflare)。
+自举: 脚本/依赖/凭据自动落地当前目录并持久化(`sb_argo.env`), NAT 机重启后 `bash sb_argo.sh` 直接恢复, 节点链接不变, 断网可用, 免 crontab。
 ```
-bash sb_argo.sh
+bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh)
 ```
 
 
