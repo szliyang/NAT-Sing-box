@@ -43,11 +43,12 @@
 # 20261011-2257 feat: sb_argo.conf 配置文件 — 面板无法注入环境变量时 KEY=VALUE 落文件(环境变量优先), diag 掩码展示
 # 20261011-2334 fix: ARGO token 直传裸 payload(实测加 JWT 头反而 not valid); conf 值剥离 \r(兼容 CRLF 上传)
 # 20261011-2353 fix: token 模式参数顺序对齐 eooce 写法(全局参数须在 tunnel 与 run 之间, 否则 token 丢失秒退致 30s 循环重启); 云端回源端口自动适配并重建 vmess 入站
+# 20261012-0004 feat: 固定+临时双隧道并行(各自 pidfile/日志/守护), 00links 同时输出 sbargo-vmess-argo 与 sbargo-vmess-temp 两条 vmess 链接
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-2353"
+SELF_VER="20261012-0004"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_FILE="${WORKDIR}/sb_argo.conf"   # 可选 KEY=VALUE 配置(面板不便传环境变量时用)
@@ -60,6 +61,8 @@ SB_BIN="${WORKDIR}/sing-box"
 CFD_BIN="${WORKDIR}/cloudflared"
 ARGO_LOG="${WORKDIR}/argo.log"
 ARGO_PID_FILE="${WORKDIR}/argo.pid"
+ARGO_TEMP_LOG="${WORKDIR}/argo-temp.log"
+ARGO_TEMP_PID_FILE="${WORKDIR}/argo-temp.pid"
 UDP_STATS_LOG="${WORKDIR}/sb-udp-stats.log"
 RUN_LOG="${WORKDIR}/sb-run.log"
 DIAG_TXT="${WORKDIR}/00diag.txt"
@@ -343,22 +346,25 @@ generate_config() {
 EOF
 }
 
-# ========== Argo 隧道(存活检测用 pidfile+kill -0, 不依赖 pgrep) ==========
-ARGO_HOST=""
-cfd_pid() { [[ -s "$ARGO_PID_FILE" ]] && cat "$ARGO_PID_FILE" 2>/dev/null || true; }
+# ========== Argo 隧道(固定+临时可并行, 存活检测用 pidfile+kill -0, 不依赖 pgrep) ==========
+ARGO_FIXED_HOST=""               # 固定域名(token 模式)
+ARGO_TEMP_HOST=""                # 临时域名(trycloudflare)
+ARGO_FIXED_ON=0
+argo_pid_of() { local f="$1"; [[ -s "$f" ]] && cat "$f" 2>/dev/null || true; }
+cfd_pid() { argo_pid_of "$ARGO_PID_FILE"; }
+cfd_alive_at() { local p; p="$(argo_pid_of "$1")"; [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; }
+cfd_alive() { cfd_alive_at "$ARGO_PID_FILE"; }
 
-cfd_alive() {
-  local p; p="$(cfd_pid)"
-  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
-}
-
-kill_stray_cfd() {  # 清理旧版本残留的无 pidfile 记录的 cloudflared
+kill_stray_cfd() {  # 清理无 pidfile 记录的游离 cloudflared(两条隧道的已跟踪进程跳过)
   [[ -d /proc ]] || return 0
-  local p cmd
+  local p pid cmd keep1 keep2
+  keep1="$(argo_pid_of "$ARGO_PID_FILE")"; keep2="$(argo_pid_of "$ARGO_TEMP_PID_FILE")"
   for p in /proc/[0-9]*/cmdline; do
+    pid="${p#/proc/}"
+    [[ "$pid" == "$keep1" || "$pid" == "$keep2" ]] && continue
     cmd="$(tr '\0' ' ' < "$p" 2>/dev/null || true)"
     case "$cmd" in
-      *"$CFD_BIN"*) kill "${p#/proc/}" 2>/dev/null || true ;;
+      *"$CFD_BIN"*) kill "$pid" 2>/dev/null || true ;;
     esac
   done
 }
@@ -381,84 +387,93 @@ argo_auth_token() {
   esac
 }
 
+# 总入口: 有 token 则 固定+临时 双隧道并行(同一 vmess 入站), 无 token 仅临时
 argo_start() {
-  if [[ -z "$CFD_BIN" ]]; then
-    ARGO_HOST="argodomain.pending"
-    return 0
-  fi
-  if cfd_alive; then
-    echo "ℹ️  [Argo] cloudflared 已在运行(pid $(cfd_pid)), 不重复启动"
-    [[ -z "${ARGO_HOST:-}" ]] && ARGO_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -n1 | sed 's#https://##' || true)"
-    return 0
-  fi
+  [[ -z "$CFD_BIN" ]] && return 0
   kill_stray_cfd
-  rm -f "$ARGO_LOG"                       # 清旧日志, 避免取到上次的临时域名
   local token=""
   [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]] && token="$(argo_auth_token)"
   if [[ -n "$token" ]]; then
-    echo "🌐 [Argo] 启动固定隧道(token): ${ARGO_DOMAIN}"
-    nohup "$CFD_BIN" tunnel --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info \
-      run --token "$token" >/dev/null 2>&1 &
-    echo $! > "$ARGO_PID_FILE"
-    ARGO_HOST="$ARGO_DOMAIN"
-    local i registered=""
-    for ((i = 1; i <= 30; i++)); do
-      registered="$(grep -o 'Registered tunnel connection' "$ARGO_LOG" 2>/dev/null | head -n1 || true)"
-      [[ -n "$registered" ]] && break
-      sleep 1
-    done
-    if [[ -n "$registered" ]]; then
-      green "✅ [Argo] 固定隧道已注册: ${ARGO_DOMAIN} (pid $(cfd_pid), 日志: ${ARGO_LOG})"
-      # 云端托管隧道的回源端口以远程配置为准, 与本地不一致时自动适配(重建 vmess 入站)
-      local rport=""
-      rport="$(grep -oE 'localhost:[0-9]+' "$ARGO_LOG" 2>/dev/null | head -n1 | cut -d: -f2 || true)"
-      if [[ -n "$rport" && "$rport" != "$ARGO_LOCAL_PORT" ]]; then
-        echo "ℹ️  [Argo] 云端回源端口=${rport}(本地当前 ${ARGO_LOCAL_PORT}), 自动切换 vmess 入站到 ${rport}"
-        ARGO_LOCAL_PORT="$rport"
-        ARGO_PORT_CHANGED=1
-      fi
-    else
-      red "⚠️ [Argo] 30s 内未确认注册(查 ${ARGO_LOG}: token 是否有效/回源是否配 HTTP://localhost:8001)"
-    fi
+    argo_fixed_start "$token"
   elif [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]]; then
-    red "⚠️ [Argo] ARGO_AUTH 无法识别(需 eyJ.. token 或含 AccountTag/TunnelSecret/TunnelID 的 json), 回退临时隧道"
-    argo_temp_start
-  else
-    argo_temp_start
+    red "⚠️ [Argo] ARGO_AUTH 无法识别(需 eyJ.. token 或含 AccountTag/TunnelSecret/TunnelID 的 json), 仅启动临时隧道"
   fi
-  if [[ -z "${ARGO_HOST:-}" ]]; then
-    red "⚠️ [Argo] 域名获取失败(不影响 vless/tuic), 可查看 ${ARGO_LOG}"
-    ARGO_HOST="argodomain.pending"
+  argo_temp_start
+}
+
+argo_fixed_start() {  # $1=token
+  if cfd_alive_at "$ARGO_PID_FILE"; then
+    echo "ℹ️  [Argo] 固定隧道已在运行(pid $(argo_pid_of "$ARGO_PID_FILE"))"
+    ARGO_FIXED_HOST="$ARGO_DOMAIN"; ARGO_FIXED_ON=1
+    return 0
+  fi
+  rm -f "$ARGO_LOG"
+  echo "🌐 [Argo] 启动固定隧道(token): ${ARGO_DOMAIN}"
+  nohup "$CFD_BIN" tunnel --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info \
+    run --token "$1" >/dev/null 2>&1 &
+  echo $! > "$ARGO_PID_FILE"
+  ARGO_FIXED_HOST="$ARGO_DOMAIN"; ARGO_FIXED_ON=1
+  local i registered=""
+  for ((i = 1; i <= 30; i++)); do
+    registered="$(grep -o 'Registered tunnel connection' "$ARGO_LOG" 2>/dev/null | head -n1 || true)"
+    [[ -n "$registered" ]] && break
+    sleep 1
+  done
+  if [[ -n "$registered" ]]; then
+    green "✅ [Argo] 固定隧道已注册: ${ARGO_DOMAIN} (pid $(argo_pid_of "$ARGO_PID_FILE"), 日志: ${ARGO_LOG})"
+    # 云端托管隧道的回源端口以远程配置为准, 与本地不一致时自动适配(重建 vmess 入站)
+    local rport=""
+    rport="$(grep -oE 'localhost:[0-9]+' "$ARGO_LOG" 2>/dev/null | head -n1 | cut -d: -f2 || true)"
+    if [[ -n "$rport" && "$rport" != "$ARGO_LOCAL_PORT" ]]; then
+      echo "ℹ️  [Argo] 云端回源端口=${rport}(本地当前 ${ARGO_LOCAL_PORT}), 自动切换 vmess 入站到 ${rport}"
+      ARGO_LOCAL_PORT="$rport"
+      ARGO_PORT_CHANGED=1
+    fi
+  else
+    red "⚠️ [Argo] 固定隧道 30s 内未确认注册(查 ${ARGO_LOG}: token 是否有效)"
+    ARGO_FIXED_HOST=""
   fi
 }
 
 argo_temp_start() {
+  if cfd_alive_at "$ARGO_TEMP_PID_FILE"; then
+    echo "ℹ️  [Argo] 临时隧道已在运行(pid $(argo_pid_of "$ARGO_TEMP_PID_FILE"))"
+    [[ -z "$ARGO_TEMP_HOST" ]] && ARGO_TEMP_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_TEMP_LOG" 2>/dev/null | head -n1 | sed 's#https://##' || true)"
+    return 0
+  fi
+  rm -f "$ARGO_TEMP_LOG"
   echo "🌐 [Argo] 启动临时隧道: 127.0.0.1:${ARGO_LOCAL_PORT} -> trycloudflare.com"
   nohup "$CFD_BIN" tunnel --url "http://127.0.0.1:${ARGO_LOCAL_PORT}" \
-    --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info >/dev/null 2>&1 &
-  echo $! > "$ARGO_PID_FILE"
+    --no-autoupdate --protocol http2 --logfile "$ARGO_TEMP_LOG" --loglevel info >/dev/null 2>&1 &
+  echo $! > "$ARGO_TEMP_PID_FILE"
   local i
   for ((i = 1; i <= 30; i++)); do
-    ARGO_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | head -n1 | sed 's#https://##' || true)"
-    [[ -n "$ARGO_HOST" ]] && break
+    ARGO_TEMP_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_TEMP_LOG" 2>/dev/null | head -n1 | sed 's#https://##' || true)"
+    [[ -n "$ARGO_TEMP_HOST" ]] && break
     sleep 1
   done
-  if [[ -n "${ARGO_HOST:-}" ]]; then
-    green "✅ [Argo] 临时隧道已启动: ${ARGO_HOST} (pid $(cfd_pid), 日志: ${ARGO_LOG})"
+  if [[ -n "$ARGO_TEMP_HOST" ]]; then
+    green "✅ [Argo] 临时隧道已启动: ${ARGO_TEMP_HOST} (pid $(argo_pid_of "$ARGO_TEMP_PID_FILE"), 日志: ${ARGO_TEMP_LOG})"
+  else
+    red "⚠️ [Argo] 临时隧道域名获取失败(不影响 vless/tuic), 可查看 ${ARGO_TEMP_LOG}"
+    ARGO_TEMP_HOST=""
   fi
 }
 
-# cloudflared 后台守护: 30s 巡检一次, 挂了自动重启隧道并刷新节点链接
+# cloudflared 后台守护: 30s 巡检两条隧道, 任一进程挂掉则补启并刷新节点链接
 argo_watch() {
   [[ -z "$CFD_BIN" ]] && return 0
   (
     while true; do
       sleep 30
-      if ! cfd_alive; then
-        echo "⚠️ [守护] cloudflared 不在运行, 重启 Argo 隧道..."
+      local dead=0
+      if [[ "${ARGO_FIXED_ON:-0}" == "1" ]] && ! cfd_alive_at "$ARGO_PID_FILE"; then dead=1; fi
+      if ! cfd_alive_at "$ARGO_TEMP_PID_FILE"; then dead=1; fi
+      if [[ $dead -eq 1 ]]; then
+        echo "⚠️ [守护] cloudflared 隧道进程缺失, 补启..."
         argo_start
         generate_links "$(get_server_ip)"
-        purple "🔗 [守护] 节点链接已刷新(临时隧道域名已换): ${LINK_TXT}"
+        purple "🔗 [守护] 节点链接已刷新: ${LINK_TXT}"
       fi
     done
   ) &
@@ -490,7 +505,8 @@ renew_all() {
   kill_sb_instances
   local f removed=0
   for f in "$ENV_FILE" "$CONF_JSON" "$CERT_PEM" "$KEY_PEM" "$LINK_TXT" \
-           "$ARGO_LOG" "$ARGO_PID_FILE" "$RUN_LOG" "${RUN_LOG}.old" "$DIAG_TXT"; do
+           "$ARGO_LOG" "$ARGO_PID_FILE" "$ARGO_TEMP_LOG" "$ARGO_TEMP_PID_FILE" \
+           "$RUN_LOG" "${RUN_LOG}.old" "$DIAG_TXT"; do
     if [[ -e "$f" ]]; then
       rm -f "$f"
       echo "   🗑️  已删除 ${f}"
@@ -501,14 +517,26 @@ renew_all() {
   green "✅ [renew] 清理完成, 二进制保留(sing-box/cloudflared 不重下), 即将全新部署"
 }
 
-# ========== 生成链接 ==========
+# ========== 生成链接(固定/临时隧道在线时各出一条 vmess) ==========
+vmess_link() {  # $1=host $2=备注
+  echo "vmess://$(echo "{ \"v\": \"2\", \"ps\": \"$2\", \"add\": \"${CFIP:-$1}\", \"port\": \"${CFPORT:-443}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$1\", \"path\": \"/vmess-argo?ed=2048\", \"tls\": \"tls\", \"sni\": \"$1\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)"
+}
+
 generate_links() {
   local ip="$1"
-  cat > "$LINK_TXT" <<EOF
-vless://${UUID}@${ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${MASQ_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}&type=tcp&headerType=none#sbargo-vless
-tuic://${UUID}:${TUIC_PASS}@${ip}:${PORT}?sni=${TUIC_SNI}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#sbargo-tuic
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"sbargo-vmess\", \"add\": \"${CFIP:-${ARGO_HOST}}\", \"port\": \"${CFPORT:-443}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ARGO_HOST}\", \"path\": \"/vmess-argo?ed=2048\", \"tls\": \"tls\", \"sni\": \"${ARGO_HOST}\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
-EOF
+  {
+    echo "vless://${UUID}@${ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${MASQ_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}&type=tcp&headerType=none#sbargo-vless"
+    echo "tuic://${UUID}:${TUIC_PASS}@${ip}:${PORT}?sni=${TUIC_SNI}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#sbargo-tuic"
+    if [[ -n "${ARGO_FIXED_HOST:-}" ]]; then
+      vmess_link "$ARGO_FIXED_HOST" "sbargo-vmess-argo"
+    fi
+    if [[ -n "${ARGO_TEMP_HOST:-}" ]]; then
+      vmess_link "$ARGO_TEMP_HOST" "sbargo-vmess-temp"
+    fi
+    if [[ -z "${ARGO_FIXED_HOST:-}" && -z "${ARGO_TEMP_HOST:-}" ]]; then
+      vmess_link "argodomain.pending" "sbargo-vmess"
+    fi
+  } > "$LINK_TXT"
   purple "🔗 [链接] 节点链接已生成: ${LINK_TXT}"
   cat "$LINK_TXT"
 }
@@ -705,12 +733,22 @@ collect_diag() {
     if [[ -s "$ARGO_PID_FILE" ]]; then
       local apid; apid="$(cat "$ARGO_PID_FILE" 2>/dev/null || true)"
       if [[ -n "$apid" ]] && kill -0 "$apid" 2>/dev/null; then
-        echo "argo.pid=${apid} 存活=yes"
+        echo "argo.pid(固定)=${apid} 存活=yes"
       else
-        echo "argo.pid=${apid:-?} 存活=no"
+        echo "argo.pid(固定)=${apid:-?} 存活=no"
       fi
     else
-      echo "argo.pid: (无 pidfile)"
+      echo "argo.pid(固定): (无 pidfile)"
+    fi
+    if [[ -s "$ARGO_TEMP_PID_FILE" ]]; then
+      local tpid; tpid="$(cat "$ARGO_TEMP_PID_FILE" 2>/dev/null || true)"
+      if [[ -n "$tpid" ]] && kill -0 "$tpid" 2>/dev/null; then
+        echo "argo-temp.pid(临时)=${tpid} 存活=yes"
+      else
+        echo "argo-temp.pid(临时)=${tpid:-?} 存活=no"
+      fi
+    else
+      echo "argo-temp.pid(临时): (无 pidfile)"
     fi
     echo
     echo "--- [10] 监听端口 ---"
@@ -719,16 +757,18 @@ collect_diag() {
     echo
     echo "--- [11] 出网探测 ---"
     echo -n "公网IP: "; curl -4 -sm 8 https://api.ipify.org 2>/dev/null || echo "(失败)"; echo
-    local host_now
-    host_now="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -n1 | sed 's#https://##' || true)"
-    [[ -z "$host_now" && -n "${ARGO_DOMAIN:-}" ]] && host_now="$ARGO_DOMAIN"
-    if [[ -n "$host_now" ]]; then
-      echo -n "CF edge (${host_now}): "
-      curl -sm 8 -o /dev/null -w '%{http_code}' "https://${host_now}" 2>/dev/null || echo " (失败)"
+    local h
+    if [[ -n "${ARGO_FIXED_HOST:-}" ]]; then
+      echo -n "CF edge 固定(${ARGO_FIXED_HOST}): "
+      curl -sm 8 -o /dev/null -w '%{http_code}' "https://${ARGO_FIXED_HOST}" 2>/dev/null || echo " (失败)"
       echo
-    else
-      echo "Argo 域名: (未从 ${ARGO_LOG} 解析到)"
     fi
+    if [[ -n "${ARGO_TEMP_HOST:-}" ]]; then
+      echo -n "CF edge 临时(${ARGO_TEMP_HOST}): "
+      curl -sm 8 -o /dev/null -w '%{http_code}' "https://${ARGO_TEMP_HOST}" 2>/dev/null || echo " (失败)"
+      echo
+    fi
+    [[ -z "${ARGO_FIXED_HOST:-}" && -z "${ARGO_TEMP_HOST:-}" ]] && echo "Argo 域名: (两条隧道均无域名)"
     echo
     echo "--- [11.5] UDP 专检(tuic 间歇故障用) ---"
     echo "UDP 缓冲: rmem_max=$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo '?') rmem_default=$(cat /proc/sys/net/core/rmem_default 2>/dev/null || echo '?')"

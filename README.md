@@ -62,6 +62,7 @@ ARGO_DOMAIN=argo.example.com
 ```
 脚本每次启动自动读取,同名环境变量优先;`renew` 不会清掉该文件,一次写入长期生效。
 固定域名模式下 vmess 链接永久稳定, 重启不再需要重新导入; 临时隧道模式每次重启域名会变。
+配置了固定域名时, 脚本会**同时**保留一条临时隧道(双 cloudflared 并行, 指向同一 vmess 入站), `00links.txt` 输出两条 vmess 链接(`sbargo-vmess-argo` 固定 / `sbargo-vmess-temp` 临时), 哪条快用哪条。
 其他: `bash sb_argo.sh --diag` = 部署+运行+2 分钟后自动生成 `00diag.txt` 诊断报告; `bash sb_argo.sh renew` = 清空凭据全新开始; 节点链接固定读 `00links.txt`。
 
 
