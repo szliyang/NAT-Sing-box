@@ -7,7 +7,8 @@
 # 用法(任选其一):
 #   1) bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh)
 #   2) curl -Ls "https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh?t=$(date +%s)" | bash
-#   3) bash sb_argo.sh   # 自举落地后本地直接运行, 断网也能跑
+#   3) bash sb_argo.sh          # 自举落地后本地直接运行, 断网也能跑
+#   4) bash sb_argo.sh --diag   # 只读自检, 生成 sb-diag.txt 排查报告(不影响运行中的节点)
 #
 # 自举(NAT 机免 crontab):
 #   - 脚本自身 + 依赖(sing-box/cloudflared) + 凭据 全部落地工作目录
@@ -16,10 +17,14 @@
 #   - 容器/主机重启后执行: bash sb_argo.sh
 # 20261011-xxxx init: 基于 sb 系列, 单端口布局(TCP+UDP 同号), vmess-ws 交 Argo 不占本地端口
 # 20261011-1602 feat: 自举 — 管道执行自动落地脚本+依赖, 凭据持久化复用(链接不变), cloudflared 纳入守护, verbose 输出
+# 20261011-1616 fix: vmess-ws 入站补 max_early_data/early_data_header_name(否则 ?ed=2048 客户端 bad request), 链接 scy=none 对齐 sb 系列
+# 20261011-1616 feat: 全量运行日志 sb-run.log; --diag 自检报告(连通性探测+凭据一致性核对+配置/日志汇总)
+# 20261011-1705 fix: 多源下载(直连->ghproxy 镜像)防墙内自更新失败; 版本号 SELF_VER 落日志/diag; diag 增加 early-data 修复生效检测
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
+SELF_VER="20261011-1705"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_JSON="${WORKDIR}/sb-argo.json"
@@ -30,6 +35,8 @@ LINK_TXT="${WORKDIR}/sb_argo_link.txt"
 SB_BIN="${WORKDIR}/sing-box"
 CFD_BIN="${WORKDIR}/cloudflared"
 ARGO_LOG="${WORKDIR}/argo.log"
+RUN_LOG="${WORKDIR}/sb-run.log"
+DIAG_TXT="${WORKDIR}/sb-diag.txt"
 RAW_BASE="https://raw.githubusercontent.com/szliyang/NAT-sing-box/main"
 SB_VER="1.10.7"
 ARGO_LOCAL_PORT="${ARGO_PORT:-8001}"
@@ -74,18 +81,39 @@ detect_arch() {
   esac
 }
 
+# ========== 多源下载: 直连失败自动走 ghproxy 镜像(墙内 NAT 机 GitHub 常不可达) ==========
+mirror_urls() {
+  echo "$1"
+  case "$1" in
+    https://raw.githubusercontent.com/*|https://github.com/*|https://objects.githubusercontent.com/*)
+      echo "https://ghproxy.net/$1"
+      echo "https://gh-proxy.com/$1"
+      ;;
+  esac
+}
+
+fetch() {  # fetch <url> <dest>: 依次尝试直连/镜像, 全部失败返回 1
+  local url="$1" dest="$2" u rc first=1
+  for u in $(mirror_urls "$url"); do
+    [[ $first -eq 0 ]] && echo "   ↪️ [镜像] ${u}"
+    first=0
+    rc=0
+    curl -fL --connect-timeout 15 --retry 1 -o "$dest" "$u" || rc=$?
+    if [[ $rc -eq 0 && -s "$dest" ]]; then return 0; fi
+    rm -f "$dest"
+  done
+  return 1
+}
+
 # ========== 自举1: 脚本自身落地(管道执行时本地没有本文件) ==========
 ensure_self() {
-  local rc=0
-  echo "📥 [自举] 拉取脚本自身: ${RAW_BASE}/sb_argo.sh"
-  curl -fL --connect-timeout 20 --retry 2 -o "${SELF_FILE}.tmp" \
-    "${RAW_BASE}/sb_argo.sh?t=$(date +%s)" || rc=$?
-  if [[ $rc -ne 0 || ! -s "${SELF_FILE}.tmp" ]]; then
+  echo "📥 [自举] 拉取脚本自身: ${RAW_BASE}/sb_argo.sh (直连失败自动切镜像)"
+  if ! fetch "${RAW_BASE}/sb_argo.sh?t=$(date +%s)" "${SELF_FILE}.tmp"; then
     rm -f "${SELF_FILE}.tmp"
     if [[ -s "$SELF_FILE" ]]; then
-      echo "⚠️ [自举] 脚本下载失败(curl ${rc}), 沿用本地版本: ${SELF_FILE}"
+      echo "⚠️ [自举] 脚本下载失败(直连+镜像均不通), 沿用本地版本: ${SELF_FILE}"
     else
-      red "⚠️ [自举] 脚本下载失败(curl ${rc}), 本次以管道副本运行; 建议将脚本手动保存到 ${SELF_FILE}"
+      red "⚠️ [自举] 脚本下载失败(直连+镜像均不通), 本次以管道副本运行; 建议将脚本手动保存到 ${SELF_FILE}"
     fi
     return 0
   fi
@@ -108,13 +136,11 @@ download_bins() {
     green "✅ [依赖] sing-box 已存在: $("$SB_BIN" version 2>/dev/null | head -n1)"
   else
     local url="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${arch}.tar.gz"
-    local rc=0
     echo "📥 [依赖] 下载 sing-box v${SB_VER}: ${url}"
-    curl -fL --connect-timeout 20 --retry 2 -o "${WORKDIR}/sb.tgz" "$url" || rc=$?
-    if [[ $rc -ne 0 || ! -s "${WORKDIR}/sb.tgz" ]]; then
+    if ! fetch "$url" "${WORKDIR}/sb.tgz"; then
       rm -f "${WORKDIR}/sb.tgz"
-      red "❌ [依赖] sing-box 下载失败(curl ${rc}), 本地亦无旧版可回退"
-      red "   常见原因: 无法访问 github.com; 手动诊断: curl -v ${url} -o /dev/null"
+      red "❌ [依赖] sing-box 下载失败(直连+镜像均不通), 本地亦无旧版可回退"
+      red "   手动诊断: curl -v ${url} -o /dev/null"
       exit 1
     fi
     tar xzf "${WORKDIR}/sb.tgz" -C "$WORKDIR" --strip-components=1 "sing-box-${SB_VER}-linux-${arch}/sing-box"
@@ -127,12 +153,10 @@ download_bins() {
     green "✅ [依赖] cloudflared 已存在: ${CFD_BIN}"
   else
     local url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
-    local rc=0
     echo "📥 [依赖] 下载 cloudflared: ${url}"
-    curl -fL --connect-timeout 20 --retry 2 -o "${CFD_BIN}.tmp" "$url" || rc=$?
-    if [[ $rc -ne 0 || ! -s "${CFD_BIN}.tmp" ]]; then
+    if ! fetch "$url" "${CFD_BIN}.tmp"; then
       rm -f "${CFD_BIN}.tmp"
-      red "⚠️ [依赖] cloudflared 下载失败(curl ${rc}), 跳过 Argo 隧道(不影响 vless/tuic)"
+      red "⚠️ [依赖] cloudflared 下载失败(直连+镜像均不通), 跳过 Argo 隧道(不影响 vless/tuic)"
       CFD_BIN=""
       return 0
     fi
@@ -239,7 +263,9 @@ generate_config() {
       "users": [{"uuid": "${UUID}", "alterId": 0}],
       "transport": {
         "type": "ws",
-        "path": "/vmess-argo"
+        "path": "/vmess-argo",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
       }
     }
   ],
@@ -301,15 +327,59 @@ generate_links() {
   cat > "$LINK_TXT" <<EOF
 vless://${UUID}@${ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${MASQ_DOMAIN}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}&type=tcp&headerType=none#sbargo-vless
 tuic://${UUID}:${TUIC_PASS}@${ip}:${PORT}?sni=${TUIC_SNI}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#sbargo-tuic
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"sbargo-vmess\", \"add\": \"${CFIP:-${ARGO_HOST}}\", \"port\": \"${CFPORT:-443}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ARGO_HOST}\", \"path\": \"/vmess-argo?ed=2048\", \"tls\": \"tls\", \"sni\": \"${ARGO_HOST}\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
+vmess://$(echo "{ \"v\": \"2\", \"ps\": \"sbargo-vmess\", \"add\": \"${CFIP:-${ARGO_HOST}}\", \"port\": \"${CFPORT:-443}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ARGO_HOST}\", \"path\": \"/vmess-argo?ed=2048\", \"tls\": \"tls\", \"sni\": \"${ARGO_HOST}\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
 EOF
   purple "🔗 [链接] 节点链接已生成: ${LINK_TXT}"
   cat "$LINK_TXT"
 }
 
+# ========== 全量日志: 本次运行所有输出同步写入 sb-run.log ==========
+setup_logging() {
+  if [[ -s "$RUN_LOG" ]] && [[ "$(wc -c < "$RUN_LOG" | tr -d ' ')" -gt 1000000 ]]; then
+    mv -f "$RUN_LOG" "${RUN_LOG}.old"
+  fi
+  exec > >(tee -a "$RUN_LOG") 2>&1
+  echo "📋 [日志] 运行日志: ${RUN_LOG} (排查用, 面板可直接下载)"
+}
+
+# ========== 启动自检: sing-box 起来后 5s 做本地连通性探测 ==========
+self_check() {
+  sleep 5
+  echo "🧪 [自检] 本地连通性探测..."
+  if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
+    green "✅ [自检] TCP 127.0.0.1:${PORT} (vless) 可达"
+  else
+    red "❌ [自检] TCP 127.0.0.1:${PORT} (vless) 不可达, 查看 ${RUN_LOG} 中 sing-box 报错"
+  fi
+  if (exec 3<>"/dev/tcp/127.0.0.1/${ARGO_LOCAL_PORT}") 2>/dev/null; then
+    green "✅ [自检] TCP 127.0.0.1:${ARGO_LOCAL_PORT} (vmess-ws) 可达"
+  else
+    red "❌ [自检] TCP 127.0.0.1:${ARGO_LOCAL_PORT} (vmess-ws) 不可达"
+  fi
+  local code
+  code="$(curl -si -m 5 -o /dev/null -w '%{http_code}' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "http://127.0.0.1:${ARGO_LOCAL_PORT}/vmess-argo" 2>/dev/null || echo 000)"
+  if [[ "$code" == "101" ]]; then
+    green "✅ [自检] vmess-ws 路径 /vmess-argo 握手应答 101"
+  else
+    red "❌ [自检] vmess-ws 握手应答 ${code} (期望 101)"
+  fi
+  local subj
+  subj="$(openssl s_client -connect "127.0.0.1:${PORT}" -servername "$MASQ_DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
+  if [[ -n "$subj" ]]; then
+    green "✅ [自检] reality 端口握手回落正常: ${subj}"
+  else
+    red "❌ [自检] reality 端口 TLS 握手无响应"
+  fi
+  echo "🧪 [自检] tuic(UDP) 无法本地探测, 请用客户端实测"
+}
+
 # ========== 守护: sing-box 前台运行(日志可见, 崩溃自动重启) ==========
 run_loop() {
   purple "🚀 [启动] sing-box 前台运行(vless+tuic :${PORT}), 日志直接输出, Ctrl+C 退出"
+  ( self_check ) &
   while true; do
     set +e
     "$SB_BIN" run -c "$CONF_JSON"
@@ -320,8 +390,101 @@ run_loop() {
   done
 }
 
+# ========== --diag: 只读自检报告, 汇总环境/凭据一致性/连通性/日志 ==========
+run_diag() {
+  echo "🧾 [诊断] 生成排查报告: ${DIAG_TXT} ..."
+  # 凭据恢复(只读)
+  PORT="?" UUID="?" TUIC_PASS="?" REALITY_PUB="?" SHORT_ID="?"
+  if [[ -s "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    PORT="$SB_PORT"; UUID="$SB_UUID"; TUIC_PASS="$SB_TUIC_PASS"; REALITY_PUB="$SB_REALITY_PUB"; SHORT_ID="$SB_SHORT_ID"
+  fi
+  {
+    echo "=============================================================="
+    echo " sb_argo 诊断报告  脚本版本 ${SELF_VER}  $(date '+%F %T %Z')"
+    echo " 注意: 本文件含节点凭据等敏感信息, 仅自行排查或发给信任的人"
+    echo "=============================================================="
+    echo "--- [1] 系统 ---"
+    uname -a || true
+    echo
+    echo "--- [2] 相关环境变量 ---"
+    env | grep -E '^(PORT|PTERODACTYL_|SERVER_|ARGO_|CFIP|CFPORT|UUID)=' | sort || echo "(无)"
+    echo
+    echo "--- [3] 工作目录文件 ---"
+    ls -la "$WORKDIR" || true
+    echo
+    echo "--- [4] 凭据文件 ${ENV_FILE} ---"
+    [[ -s "$ENV_FILE" ]] && cat "$ENV_FILE" || echo "(不存在)"
+    echo
+    echo "--- [5] 配置 ${CONF_JSON} ---"
+    [[ -s "$CONF_JSON" ]] && cat "$CONF_JSON" || echo "(不存在)"
+    if grep -q 'max_early_data' "$CONF_JSON" 2>/dev/null; then
+      echo ">>> vmess early-data 修复: 已生效(20261011-1616+ 版本配置)"
+    else
+      red ">>> vmess early-data 修复: 未生效! 当前配置由旧版脚本生成, 请重新部署拉取新版"
+    fi
+    echo
+    echo "--- [6] 节点链接 ${LINK_TXT} ---"
+    [[ -s "$LINK_TXT" ]] && cat "$LINK_TXT" || echo "(不存在)"
+    echo
+    echo "--- [7] vmess 链接解码(核对客户端实际参数) ---"
+    local b64 vm
+    b64="$(sed -n 's#^vmess://##p' "$LINK_TXT" 2>/dev/null | head -n1 || true)"
+    vm="$(echo "$b64" | base64 -d 2>/dev/null || true)"
+    if [[ -n "$vm" ]]; then echo "$vm"; else echo "(解码失败)"; fi
+    echo
+    echo "--- [8] 凭据一致性核对(链接 vs env vs 配置) ---"
+    local cfg
+    cfg="$(cat "$CONF_JSON" 2>/dev/null || true)"
+    local l_uuid l_pbk l_sid l_tpass
+    l_uuid="$(sed -n 's#^vless://\([^@]*\)@.*#\1#p' "$LINK_TXT" 2>/dev/null | head -n1 || true)"
+    l_pbk="$(sed -n 's#.*pbk=\([^&]*\)&.*#\1#p' "$LINK_TXT" 2>/dev/null | head -n1 || true)"
+    l_sid="$(sed -n 's#.*sid=\([^&]*\)&.*#\1#p' "$LINK_TXT" 2>/dev/null | head -n1 || true)"
+    l_tpass="$(sed -n 's#^tuic://[^:]*:\([^@]*\)@.*#\1#p' "$LINK_TXT" 2>/dev/null | head -n1 || true)"
+    [[ "$l_uuid" == "$UUID" ]] && echo "UUID 一致: ${UUID:0:8}..." || red "UUID 不一致! 链接=${l_uuid:0:8}... env=${UUID:0:8}... (客户端用了旧链接?)"
+    [[ "$l_pbk" == "$REALITY_PUB" ]] && echo "pbk 一致" || red "pbk 不一致! (客户端用了旧链接?)"
+    [[ "$l_sid" == "$SHORT_ID" ]] && echo "sid 一致" || red "sid 不一致! (客户端用了旧链接?)"
+    [[ "$l_tpass" == "$TUIC_PASS" ]] && echo "tuic 密码一致" || red "tuic 密码不一致! (客户端用了旧链接?)"
+    [[ "$cfg" == *"${UUID}"* ]] && echo "配置内 UUID 与 env 一致" || red "配置内 UUID 与 env 不一致!"
+    echo
+    echo "--- [9] 进程 ---"
+    pgrep -af 'sing-box|cloudflared' || echo "(未发现 sing-box/cloudflared 进程)"
+    echo
+    echo "--- [10] 监听端口 ---"
+    (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || netstat -an 2>/dev/null | head -30) | grep -vE '^Active|^Proto$' || true
+    (ss -ulnp 2>/dev/null || netstat -ulnp 2>/dev/null) | grep -vE '^Active|^Proto$' || true
+    echo
+    echo "--- [11] 出网探测 ---"
+    echo -n "公网IP: "; curl -4 -sm 8 https://api.ipify.org 2>/dev/null || echo "(失败)"
+    local host_now
+    host_now="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -n1 | sed 's#https://##' || true)"
+    [[ -z "$host_now" && -n "${ARGO_DOMAIN:-}" ]] && host_now="$ARGO_DOMAIN"
+    if [[ -n "$host_now" ]]; then
+      echo -n "CF edge (${host_now}): "
+      curl -sm 8 -o /dev/null -w '%{http_code}' "https://${host_now}" 2>/dev/null || echo " (失败)"
+      echo
+    else
+      echo "Argo 域名: (未从 ${ARGO_LOG} 解析到)"
+    fi
+    echo
+    echo "--- [12] Argo 日志 ${ARGO_LOG} (末 40 行) ---"
+    tail -n 40 "$ARGO_LOG" 2>/dev/null || echo "(不存在)"
+    echo
+    echo "--- [13] 运行日志 ${RUN_LOG} (末 80 行) ---"
+    tail -n 80 "$RUN_LOG" 2>/dev/null || echo "(不存在)"
+    echo
+    echo "=============================================================="
+    echo " 报告结束: ${DIAG_TXT}"
+    echo "=============================================================="
+  } > "$DIAG_TXT" 2>&1
+  echo "✅ [诊断] 报告已生成: ${DIAG_TXT} (含敏感信息, 注意保管)"
+}
+
 # ========== 主流程 ==========
 main() {
+  setup_logging
+  echo "🧩 [版本] sb_argo ${SELF_VER}"
   echo "📁 工作目录: ${WORKDIR}"
   echo "🖥️  系统: $(uname -sm)"
   detect_port
@@ -345,4 +508,9 @@ main() {
   run_loop
 }
 
+# ========== 入口: --diag 只读诊断, 其余正常部署 ==========
+if [[ "${1:-}" == "--diag" || "${1:-}" == "diag" ]]; then
+  run_diag
+  exit 0
+fi
 main
