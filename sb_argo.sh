@@ -20,11 +20,13 @@
 # 20261011-1616 fix: vmess-ws 入站补 max_early_data/early_data_header_name(否则 ?ed=2048 客户端 bad request), 链接 scy=none 对齐 sb 系列
 # 20261011-1616 feat: 全量运行日志 sb-run.log; --diag 自检报告(连通性探测+凭据一致性核对+配置/日志汇总)
 # 20261011-1705 fix: 多源下载(直连->ghproxy 镜像)防墙内自更新失败; 版本号 SELF_VER 落日志/diag; diag 增加 early-data 修复生效检测
+# 20261011-1724 fix: cloudflared 存活检测改 pidfile+kill -0(容器无 pgrep 曾致每 30s 误重启换域名); 自检 101 前缀匹配; diag 进程段改 /proc 扫描
+# 20261011-1727 feat: 启动时外部命令依赖自检(必需缺失即退出, 可选报告备选); seq 改 bash 内建循环; diag 增命令清单段
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-1705"
+SELF_VER="20261011-1727"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_JSON="${WORKDIR}/sb-argo.json"
@@ -35,6 +37,7 @@ LINK_TXT="${WORKDIR}/sb_argo_link.txt"
 SB_BIN="${WORKDIR}/sing-box"
 CFD_BIN="${WORKDIR}/cloudflared"
 ARGO_LOG="${WORKDIR}/argo.log"
+ARGO_PID_FILE="${WORKDIR}/argo.pid"
 RUN_LOG="${WORKDIR}/sb-run.log"
 DIAG_TXT="${WORKDIR}/sb-diag.txt"
 RAW_BASE="https://raw.githubusercontent.com/szliyang/NAT-sing-box/main"
@@ -103,6 +106,27 @@ fetch() {  # fetch <url> <dest>: 依次尝试直连/镜像, 全部失败返回 1
     rm -f "$dest"
   done
   return 1
+}
+
+# ========== 启动依赖自检: 外部命令缺失早报告, 不等到运行中才炸 ==========
+check_deps() {
+  local fatal=0 opt="" cmd
+  for cmd in curl tar openssl base64 tee awk sed grep tr cmp wc uname nohup sleep date cat; do
+    command -v "$cmd" >/dev/null 2>&1 || { red "❌ [依赖] 缺少必需命令: ${cmd}"; fatal=1; }
+  done
+  command -v shuf >/dev/null 2>&1 || opt="${opt} shuf(备选:RANDOM)"
+  if [[ ! -r /proc/sys/kernel/random/uuid ]] && ! command -v uuidgen >/dev/null 2>&1; then
+    red "❌ [依赖] 无法生成 UUID(/proc/sys/kernel/random/uuid 与 uuidgen 均不可用)"
+    fatal=1
+  fi
+  command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1 \
+    || opt="${opt} ss/netstat(仅影响 --diag 端口展示)"
+  if [[ $fatal -eq 1 ]]; then
+    red "❌ [依赖] 必需命令缺失, 无法继续; 精简容器请换基础镜像或安装 coreutils/procps"
+    exit 1
+  fi
+  [[ -n "$opt" ]] && echo "⚠️ [依赖] 可选命令缺失(已有备选):${opt}"
+  green "✅ [依赖] 外部命令自检通过"
 }
 
 # ========== 自举1: 脚本自身落地(管道执行时本地没有本文件) ==========
@@ -274,31 +298,57 @@ generate_config() {
 EOF
 }
 
-# ========== Argo 隧道 ==========
+# ========== Argo 隧道(存活检测用 pidfile+kill -0, 不依赖 pgrep) ==========
 ARGO_HOST=""
+cfd_pid() { [[ -s "$ARGO_PID_FILE" ]] && cat "$ARGO_PID_FILE" 2>/dev/null || true; }
+
+cfd_alive() {
+  local p; p="$(cfd_pid)"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+}
+
+kill_stray_cfd() {  # 清理旧版本残留的无 pidfile 记录的 cloudflared
+  [[ -d /proc ]] || return 0
+  local p cmd
+  for p in /proc/[0-9]*/cmdline; do
+    cmd="$(tr '\0' ' ' < "$p" 2>/dev/null || true)"
+    case "$cmd" in
+      *"$CFD_BIN"*) kill "${p#/proc/}" 2>/dev/null || true ;;
+    esac
+  done
+}
+
 argo_start() {
   if [[ -z "$CFD_BIN" ]]; then
     ARGO_HOST="argodomain.pending"
     return 0
   fi
+  if cfd_alive; then
+    echo "ℹ️  [Argo] cloudflared 已在运行(pid $(cfd_pid)), 不重复启动"
+    [[ -z "${ARGO_HOST:-}" ]] && ARGO_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -n1 | sed 's#https://##' || true)"
+    return 0
+  fi
+  kill_stray_cfd
   rm -f "$ARGO_LOG"                       # 清旧日志, 避免取到上次的临时域名
   if [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]]; then
     echo "🌐 [Argo] 启动固定隧道(token): ${ARGO_DOMAIN}"
     nohup "$CFD_BIN" tunnel run --token "$ARGO_AUTH" --logfile "$ARGO_LOG" >/dev/null 2>&1 &
+    echo $! > "$ARGO_PID_FILE"
     ARGO_HOST="$ARGO_DOMAIN"
   else
     echo "🌐 [Argo] 启动临时隧道: 127.0.0.1:${ARGO_LOCAL_PORT} -> trycloudflare.com"
     nohup "$CFD_BIN" tunnel --url "http://127.0.0.1:${ARGO_LOCAL_PORT}" \
       --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info >/dev/null 2>&1 &
+    echo $! > "$ARGO_PID_FILE"
     local i
-    for i in $(seq 1 30); do
+    for ((i = 1; i <= 30; i++)); do
       ARGO_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | head -n1 | sed 's#https://##' || true)"
       [[ -n "$ARGO_HOST" ]] && break
       sleep 1
     done
   fi
-  if [[ -n "$ARGO_HOST" ]]; then
-    green "✅ [Argo] 隧道已启动: ${ARGO_HOST} (日志: ${ARGO_LOG})"
+  if [[ -n "${ARGO_HOST:-}" ]]; then
+    green "✅ [Argo] 隧道已启动: ${ARGO_HOST} (pid $(cfd_pid), 日志: ${ARGO_LOG})"
   else
     red "⚠️ [Argo] 域名获取失败(不影响 vless/tuic), 可查看 ${ARGO_LOG}"
     ARGO_HOST="argodomain.pending"
@@ -311,7 +361,7 @@ argo_watch() {
   (
     while true; do
       sleep 30
-      if ! pgrep -f "$CFD_BIN" >/dev/null 2>&1; then
+      if ! cfd_alive; then
         echo "⚠️ [守护] cloudflared 不在运行, 重启 Argo 隧道..."
         argo_start
         generate_links "$(get_server_ip)"
@@ -360,8 +410,8 @@ self_check() {
   code="$(curl -si -m 5 -o /dev/null -w '%{http_code}' \
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-    "http://127.0.0.1:${ARGO_LOCAL_PORT}/vmess-argo" 2>/dev/null || echo 000)"
-  if [[ "$code" == "101" ]]; then
+    "http://127.0.0.1:${ARGO_LOCAL_PORT}/vmess-argo" 2>/dev/null || true)"
+  if [[ "$code" == 101* ]]; then
     green "✅ [自检] vmess-ws 路径 /vmess-argo 握手应答 101"
   else
     red "❌ [自检] vmess-ws 握手应答 ${code} (期望 101)"
@@ -408,6 +458,12 @@ run_diag() {
     echo "--- [1] 系统 ---"
     uname -a || true
     echo
+    echo "--- [1.5] 外部命令自检 ---"
+    local c
+    for c in curl tar openssl base64 tee awk sed grep tr cmp wc uname nohup pgrep ss netstat shuf uuidgen; do
+      if command -v "$c" >/dev/null 2>&1; then echo "  ${c}: ok"; else red "  ${c}: 缺失"; fi
+    done
+    echo
     echo "--- [2] 相关环境变量 ---"
     env | grep -E '^(PORT|PTERODACTYL_|SERVER_|ARGO_|CFIP|CFPORT|UUID)=' | sort || echo "(无)"
     echo
@@ -449,14 +505,35 @@ run_diag() {
     [[ "$cfg" == *"${UUID}"* ]] && echo "配置内 UUID 与 env 一致" || red "配置内 UUID 与 env 不一致!"
     echo
     echo "--- [9] 进程 ---"
-    pgrep -af 'sing-box|cloudflared' || echo "(未发现 sing-box/cloudflared 进程)"
+    if [[ -d /proc ]]; then
+      local p cmd found=0
+      for p in /proc/[0-9]*/cmdline; do
+        cmd="$(tr '\0' ' ' < "$p" 2>/dev/null || true)"
+        case "$cmd" in
+          *sing-box*|*cloudflared*) echo "pid ${p#/proc/}: ${cmd}"; found=1 ;;
+        esac
+      done
+      [[ $found -eq 0 ]] && echo "(未发现 sing-box/cloudflared 进程)"
+    else
+      pgrep -af 'sing-box|cloudflared' || echo "(未发现 sing-box/cloudflared 进程, 且本机无 /proc)"
+    fi
+    if [[ -s "$ARGO_PID_FILE" ]]; then
+      local apid; apid="$(cat "$ARGO_PID_FILE" 2>/dev/null || true)"
+      if [[ -n "$apid" ]] && kill -0 "$apid" 2>/dev/null; then
+        echo "argo.pid=${apid} 存活=yes"
+      else
+        echo "argo.pid=${apid:-?} 存活=no"
+      fi
+    else
+      echo "argo.pid: (无 pidfile)"
+    fi
     echo
     echo "--- [10] 监听端口 ---"
     (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || netstat -an 2>/dev/null | head -30) | grep -vE '^Active|^Proto$' || true
     (ss -ulnp 2>/dev/null || netstat -ulnp 2>/dev/null) | grep -vE '^Active|^Proto$' || true
     echo
     echo "--- [11] 出网探测 ---"
-    echo -n "公网IP: "; curl -4 -sm 8 https://api.ipify.org 2>/dev/null || echo "(失败)"
+    echo -n "公网IP: "; curl -4 -sm 8 https://api.ipify.org 2>/dev/null || echo "(失败)"; echo
     local host_now
     host_now="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -n1 | sed 's#https://##' || true)"
     [[ -z "$host_now" && -n "${ARGO_DOMAIN:-}" ]] && host_now="$ARGO_DOMAIN"
@@ -485,6 +562,7 @@ run_diag() {
 main() {
   setup_logging
   echo "🧩 [版本] sb_argo ${SELF_VER}"
+  check_deps
   echo "📁 工作目录: ${WORKDIR}"
   echo "🖥️  系统: $(uname -sm)"
   detect_port
