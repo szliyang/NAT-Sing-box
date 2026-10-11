@@ -20,7 +20,12 @@
 # Argo 固定域名(可选, 免去临时隧道每次重启换域名):
 #   ARGO_AUTH: Cloudflare Zero Trust 隧道 token(eyJ..) 或 json {"AccountTag":..,"TunnelSecret":..,"TunnelID":..}
 #   ARGO_DOMAIN: 隧道公共主机名(如 argo.example.com); 回源 Service 填 HTTP://localhost:8001
-#   示例: ARGO_AUTH=eyJ.. ARGO_DOMAIN=argo.example.com bash sb_argo.sh
+#   两种注入方式:
+#     a) 环境变量: ARGO_AUTH=eyJ.. ARGO_DOMAIN=argo.example.com bash sb_argo.sh
+#     b) 配置文件(面板不便传环境变量时): 工作目录写 sb_argo.conf, 每行 KEY=VALUE:
+#          ARGO_AUTH=eyJ..
+#          ARGO_DOMAIN=argo.example.com
+#        环境变量优先于文件; 文件不会被 renew 清掉
 #   步骤: 域名托管到 Cloudflare -> Zero Trust -> Networks/Tunnels -> 创建隧道(复制 token)
 #         -> Public Hostname 填子域名, Type=HTTP, URL=localhost, Port=8001
 # 20261011-xxxx init: 基于 sb 系列, 单端口布局(TCP+UDP 同号), vmess-ws 交 Argo 不占本地端口
@@ -35,13 +40,15 @@
 # 20261011-1810 feat: --diag 改为"部署+运行+自动采集"一条龙, 报告固定写 00diag.txt(启动约 2 分钟后生成, 节点持续运行)
 # 20261011-1815 feat: 节点链接文件改名 00links.txt(与 00diag.txt 同前缀, 排序靠前便于下载查看)
 # 20261011-2223 feat: Argo 固定域名 — ARGO_AUTH 兼容 eyJ token/json 两种格式, 启动等待"Registered"确认并回报
+# 20261011-2257 feat: sb_argo.conf 配置文件 — 面板无法注入环境变量时 KEY=VALUE 落文件(环境变量优先), diag 掩码展示
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-2223"
+SELF_VER="20261011-2257"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
+CONF_FILE="${WORKDIR}/sb_argo.conf"   # 可选 KEY=VALUE 配置(面板不便传环境变量时用)
 CONF_JSON="${WORKDIR}/sb-argo.json"
 ENV_FILE="${WORKDIR}/sb_argo.env"
 CERT_PEM="${WORKDIR}/sb-cert.pem"
@@ -120,6 +127,27 @@ fetch() {  # fetch <url> <dest>: 依次尝试直连/镜像, 全部失败返回 1
     rm -f "$dest"
   done
   return 1
+}
+
+# ========== 可选配置文件 sb_argo.conf: KEY=VALUE, 已有环境变量优先(不覆盖) ==========
+load_conf() {
+  [[ -s "$CONF_FILE" ]] || return 0
+  local line k v loaded=""
+  while IFS= read -r line; do
+    case "$line" in ''|\#*) continue ;; esac
+    [[ "$line" != *=* ]] && continue
+    k="$(echo "${line%%=*}" | tr -d '[:space:]')"
+    v="${line#*=}"
+    [[ -z "$k" ]] && continue
+    [[ -n "${!k:-}" ]] && continue          # 环境变量已存在则不覆盖
+    export "$k=$v"
+    loaded="${loaded}${k} "
+  done < "$CONF_FILE"
+  if [[ -n "$loaded" ]]; then
+    echo "📄 [配置] 已从 ${CONF_FILE} 加载: ${loaded}(环境变量优先)"
+  else
+    echo "📄 [配置] ${CONF_FILE} 存在但无新增变量(全部已被环境变量覆盖)"
+  fi
 }
 
 # ========== 启动依赖自检: 外部命令缺失早报告, 不等到运行中才炸 ==========
@@ -604,6 +632,12 @@ collect_diag() {
     echo
     echo "--- [2] 相关环境变量 ---"
     env | grep -E '^(PORT|PTERODACTYL_|SERVER_|ARGO_|CFIP|CFPORT|UUID)=' | sort || echo "(无)"
+    echo "配置文件 ${CONF_FILE}: "
+    if [[ -s "$CONF_FILE" ]]; then
+      awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ {printf "  %s=%s...(掩码)\n", $1, substr($2,1,8)}' "$CONF_FILE"
+    else
+      echo "  (不存在)"
+    fi
     echo
     echo "--- [3] 工作目录文件 ---"
     ls -la "$WORKDIR" || true
@@ -722,6 +756,7 @@ main() {
   setup_logging
   echo "🧩 [版本] sb_argo ${SELF_VER}"
   check_deps
+  load_conf
   echo "📁 工作目录: ${WORKDIR}"
   echo "🖥️  系统: $(uname -sm)"
   detect_port

@@ -55,6 +55,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_
 ARGO_AUTH=eyJ... ARGO_DOMAIN=argo.example.com bash sb_argo.sh
 ```
 `ARGO_AUTH` 也接受 json 格式 `{"AccountTag":..,"TunnelSecret":..,"TunnelID":..}`(脚本自动转 token)。
+**面板无法注入环境变量时**: 在工作目录放一个 `sb_argo.conf` 文件(每行 `KEY=VALUE`,支持 `#` 注释):
+```
+ARGO_AUTH=eyJ...
+ARGO_DOMAIN=argo.example.com
+```
+脚本每次启动自动读取,同名环境变量优先;`renew` 不会清掉该文件,一次写入长期生效。
 固定域名模式下 vmess 链接永久稳定, 重启不再需要重新导入; 临时隧道模式每次重启域名会变。
 其他: `bash sb_argo.sh --diag` = 部署+运行+2 分钟后自动生成 `00diag.txt` 诊断报告; `bash sb_argo.sh renew` = 清空凭据全新开始; 节点链接固定读 `00links.txt`。
 
