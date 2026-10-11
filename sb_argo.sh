@@ -24,11 +24,12 @@
 # 20261011-1724 fix: cloudflared 存活检测改 pidfile+kill -0(容器无 pgrep 曾致每 30s 误重启换域名); 自检 101 前缀匹配; diag 进程段改 /proc 扫描
 # 20261011-1727 feat: 启动时外部命令依赖自检(必需缺失即退出, 可选报告备选); seq 改 bash 内建循环; diag 增命令清单段
 # 20261011-1733 feat: renew 参数 — 停旧进程+清凭据/配置/证书/链接/日志, 全新部署(节点链接全部更换)
+# 20261011-1758 feat: tuic 诊断 — 本地回环自测(sing-box 自身当客户端), 后台每 60s 采样内核 UDP 计数/负载, diag 增 UDP 专检
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-1733"
+SELF_VER="20261011-1758"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_JSON="${WORKDIR}/sb-argo.json"
@@ -40,6 +41,7 @@ SB_BIN="${WORKDIR}/sing-box"
 CFD_BIN="${WORKDIR}/cloudflared"
 ARGO_LOG="${WORKDIR}/argo.log"
 ARGO_PID_FILE="${WORKDIR}/argo.pid"
+UDP_STATS_LOG="${WORKDIR}/sb-udp-stats.log"
 RUN_LOG="${WORKDIR}/sb-run.log"
 DIAG_TXT="${WORKDIR}/sb-diag.txt"
 RAW_BASE="https://raw.githubusercontent.com/szliyang/NAT-sing-box/main"
@@ -427,6 +429,9 @@ setup_logging() {
   if [[ -s "$RUN_LOG" ]] && [[ "$(wc -c < "$RUN_LOG" | tr -d ' ')" -gt 1000000 ]]; then
     mv -f "$RUN_LOG" "${RUN_LOG}.old"
   fi
+  if [[ -s "$UDP_STATS_LOG" ]] && [[ "$(wc -c < "$UDP_STATS_LOG" | tr -d ' ')" -gt 200000 ]]; then
+    mv -f "$UDP_STATS_LOG" "${UDP_STATS_LOG}.old"
+  fi
   exec > >(tee -a "$RUN_LOG") 2>&1
   echo "📋 [日志] 运行日志: ${RUN_LOG} (排查用, 面板可直接下载)"
 }
@@ -462,7 +467,48 @@ self_check() {
   else
     red "❌ [自检] reality 端口 TLS 握手无响应"
   fi
-  echo "🧪 [自检] tuic(UDP) 无法本地探测, 请用客户端实测"
+  tuic_selftest
+}
+
+# tuic 本地回环自测: 用 sing-box 自身当客户端走 127.0.0.1, 区分"服务端坏了"还是"客户端/链路问题"
+tuic_selftest() {
+  local tconf="${WORKDIR}/.tuic-test.json" tport=18234 tcode="" tpid=""
+  echo "🧪 [自检] tuic 本地回环代理测试(区分服务端/客户端侧)..."
+  cat > "$tconf" <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [{"type": "mixed", "tag": "test-in", "listen": "127.0.0.1", "listen_port": ${tport}}],
+  "outbounds": [{"type": "tuic", "tag": "test-out", "server": "127.0.0.1", "server_port": ${PORT},
+    "uuid": "${UUID}", "password": "${TUIC_PASS}", "congestion_control": "bbr", "udp_relay_mode": "native",
+    "tls": {"enabled": true, "insecure": true, "alpn": ["h3"]}}]
+}
+EOF
+  chmod 600 "$tconf" || true
+  set +e
+  "$SB_BIN" run -c "$tconf" >/dev/null 2>&1 &
+  tpid=$!
+  sleep 3
+  tcode="$(curl -sx "http://127.0.0.1:${tport}" -m 12 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204 2>/dev/null || true)"
+  kill "$tpid" 2>/dev/null
+  set -e
+  rm -f "$tconf"
+  if [[ "$tcode" == "204" || "$tcode" == "200" ]]; then
+    green "✅ [自检] tuic 回环代理通过(HTTP ${tcode}): 服务端 tuic 正常; 客户端不通 → 查客户端配置/UDP 链路"
+  else
+    red "❌ [自检] tuic 回环代理失败(HTTP ${tcode:-无响应}): 服务端 tuic 本身异常, 与客户端无关"
+  fi
+}
+
+# ========== UDP 后台采样: 每 60s 记内核 UDP 计数器+负载, 供间歇故障对时 ==========
+udp_monitor() {
+  (
+    [[ -r /proc/net/snmp ]] || exit 0
+    echo "# time load= | Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti"
+    while true; do
+      echo "$(date '+%F %T') load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null) $(grep -A1 '^Udp:' /proc/net/snmp 2>/dev/null | tail -n1)" >> "$UDP_STATS_LOG" 2>/dev/null || true
+      sleep 60
+    done
+  ) &
 }
 
 # ========== 守护: sing-box 前台运行(日志可见, 崩溃自动重启) ==========
@@ -584,6 +630,15 @@ run_diag() {
       echo "Argo 域名: (未从 ${ARGO_LOG} 解析到)"
     fi
     echo
+    echo "--- [11.5] UDP 专检(tuic 间歇故障用) ---"
+    echo "UDP 缓冲: rmem_max=$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo '?') rmem_default=$(cat /proc/sys/net/core/rmem_default 2>/dev/null || echo '?')"
+    echo -n "UDP 监听: "
+    (ss -ulnp 2>/dev/null || netstat -ulnp 2>/dev/null) | grep -viE '^State|^Proto|command not found' | grep -iE "udp|:${SB_PORT:-}" | head -3 || echo "(未查到)"
+    echo "UDP 计数(当前): $(grep -A1 '^Udp:' /proc/net/snmp 2>/dev/null | tail -n1)"
+    echo "UDP 采样(首): $(sed -n '2p' "$UDP_STATS_LOG" 2>/dev/null)"
+    echo "UDP 采样(末): $(tail -n1 "$UDP_STATS_LOG" 2>/dev/null)"
+    echo "tuic 错误统计(本次运行): $(grep -c 'tuic.*authentication timeout' "$RUN_LOG" 2>/dev/null || true) 次 authentication timeout"
+    echo
     echo "--- [12] Argo 日志 ${ARGO_LOG} (末 40 行) ---"
     tail -n 40 "$ARGO_LOG" 2>/dev/null || echo "(不存在)"
     echo
@@ -618,6 +673,7 @@ main() {
   generate_config
   argo_start
   argo_watch
+  udp_monitor
   local ip; ip="$(get_server_ip)"
   echo "🌐 服务器 IP: ${ip}"
   generate_links "$ip"
