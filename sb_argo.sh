@@ -8,7 +8,7 @@
 #   1) bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh)
 #   2) curl -Ls "https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh?t=$(date +%s)" | bash
 #   3) bash sb_argo.sh          # 自举落地后本地直接运行, 断网也能跑
-#   4) bash sb_argo.sh --diag   # 只读自检, 生成 sb-diag.txt 排查报告(不影响运行中的节点)
+#   4) bash sb_argo.sh --diag   # 部署并运行节点, 启动约 2 分钟后自动生成 00diag.txt 诊断报告
 #   5) bash sb_argo.sh renew    # 删旧配置全新开始(停旧进程+清凭据/配置/证书/链接/日志, 二进制保留)
 #
 # 自举(NAT 机免 crontab):
@@ -25,25 +25,27 @@
 # 20261011-1727 feat: 启动时外部命令依赖自检(必需缺失即退出, 可选报告备选); seq 改 bash 内建循环; diag 增命令清单段
 # 20261011-1733 feat: renew 参数 — 停旧进程+清凭据/配置/证书/链接/日志, 全新部署(节点链接全部更换)
 # 20261011-1758 feat: tuic 诊断 — 本地回环自测(sing-box 自身当客户端), 后台每 60s 采样内核 UDP 计数/负载, diag 增 UDP 专检
+# 20261011-1810 feat: --diag 改为"部署+运行+自动采集"一条龙, 报告固定写 00diag.txt(启动约 2 分钟后生成, 节点持续运行)
+# 20261011-1815 feat: 节点链接文件改名 00links.txt(与 00diag.txt 同前缀, 排序靠前便于下载查看)
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-1758"
+SELF_VER="20261011-1815"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_JSON="${WORKDIR}/sb-argo.json"
 ENV_FILE="${WORKDIR}/sb_argo.env"
 CERT_PEM="${WORKDIR}/sb-cert.pem"
 KEY_PEM="${WORKDIR}/sb-key.pem"
-LINK_TXT="${WORKDIR}/sb_argo_link.txt"
+LINK_TXT="${WORKDIR}/00links.txt"
 SB_BIN="${WORKDIR}/sing-box"
 CFD_BIN="${WORKDIR}/cloudflared"
 ARGO_LOG="${WORKDIR}/argo.log"
 ARGO_PID_FILE="${WORKDIR}/argo.pid"
 UDP_STATS_LOG="${WORKDIR}/sb-udp-stats.log"
 RUN_LOG="${WORKDIR}/sb-run.log"
-DIAG_TXT="${WORKDIR}/sb-diag.txt"
+DIAG_TXT="${WORKDIR}/00diag.txt"
 RAW_BASE="https://raw.githubusercontent.com/szliyang/NAT-sing-box/main"
 SB_VER="1.10.7"
 ARGO_LOCAL_PORT="${ARGO_PORT:-8001}"
@@ -436,37 +438,46 @@ setup_logging() {
   echo "📋 [日志] 运行日志: ${RUN_LOG} (排查用, 面板可直接下载)"
 }
 
-# ========== 启动自检: sing-box 起来后 5s 做本地连通性探测 ==========
-self_check() {
-  sleep 5
-  echo "🧪 [自检] 本地连通性探测..."
-  if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
-    green "✅ [自检] TCP 127.0.0.1:${PORT} (vless) 可达"
+# ========== 探测原语(启动自检与 --diag 共用) ==========
+probe_tcp() {  # probe_tcp <名称> <端口>
+  if (exec 3<>"/dev/tcp/127.0.0.1/$2") 2>/dev/null; then
+    green "✅ TCP $1 127.0.0.1:$2 可达"
   else
-    red "❌ [自检] TCP 127.0.0.1:${PORT} (vless) 不可达, 查看 ${RUN_LOG} 中 sing-box 报错"
+    red "❌ TCP $1 127.0.0.1:$2 不可达"
   fi
-  if (exec 3<>"/dev/tcp/127.0.0.1/${ARGO_LOCAL_PORT}") 2>/dev/null; then
-    green "✅ [自检] TCP 127.0.0.1:${ARGO_LOCAL_PORT} (vmess-ws) 可达"
-  else
-    red "❌ [自检] TCP 127.0.0.1:${ARGO_LOCAL_PORT} (vmess-ws) 不可达"
-  fi
+}
+
+probe_ws() {
   local code
   code="$(curl -si -m 5 -o /dev/null -w '%{http_code}' \
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
     "http://127.0.0.1:${ARGO_LOCAL_PORT}/vmess-argo" 2>/dev/null || true)"
   if [[ "$code" == 101* ]]; then
-    green "✅ [自检] vmess-ws 路径 /vmess-argo 握手应答 101"
+    green "✅ vmess-ws /vmess-argo 握手 101"
   else
-    red "❌ [自检] vmess-ws 握手应答 ${code} (期望 101)"
+    red "❌ vmess-ws 握手 ${code:-无} (期望 101)"
   fi
+}
+
+probe_reality() {
   local subj
   subj="$(openssl s_client -connect "127.0.0.1:${PORT}" -servername "$MASQ_DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
   if [[ -n "$subj" ]]; then
-    green "✅ [自检] reality 端口握手回落正常: ${subj}"
+    green "✅ reality 端口 TLS 回落正常: ${subj}"
   else
-    red "❌ [自检] reality 端口 TLS 握手无响应"
+    red "❌ reality 端口 TLS 握手无响应"
   fi
+}
+
+# ========== 启动自检: sing-box 起来后 5s 做本地连通性探测 ==========
+self_check() {
+  sleep 5
+  echo "🧪 [自检] 本地连通性探测..."
+  probe_tcp "vless" "$PORT"
+  probe_tcp "vmess-ws" "$ARGO_LOCAL_PORT"
+  probe_ws
+  probe_reality
   tuic_selftest
 }
 
@@ -525,16 +536,12 @@ run_loop() {
   done
 }
 
-# ========== --diag: 只读自检报告, 汇总环境/凭据一致性/连通性/日志 ==========
-run_diag() {
-  echo "🧾 [诊断] 生成排查报告: ${DIAG_TXT} ..."
-  # 凭据恢复(只读)
-  PORT="?" UUID="?" TUIC_PASS="?" REALITY_PUB="?" SHORT_ID="?"
-  if [[ -s "$ENV_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    PORT="$SB_PORT"; UUID="$SB_UUID"; TUIC_PASS="$SB_TUIC_PASS"; REALITY_PUB="$SB_REALITY_PUB"; SHORT_ID="$SB_SHORT_ID"
-  fi
+# ========== --diag: 部署后自动采集全部诊断到 00diag.txt(单命令容器友好) ==========
+collect_diag() {
+  echo "🧾 [诊断] 节点已运行, 诊断采集中; 约 2 分钟后自动生成: ${DIAG_TXT}"
+  sleep 45        # 等自检/客户端流量积累
+  local udp1
+  udp1="$(grep -A1 '^Udp:' /proc/net/snmp 2>/dev/null | tail -n1 || true)"
   {
     echo "=============================================================="
     echo " sb_argo 诊断报告  脚本版本 ${SELF_VER}  $(date '+%F %T %Z')"
@@ -645,6 +652,18 @@ run_diag() {
     echo "--- [13] 运行日志 ${RUN_LOG} (末 80 行) ---"
     tail -n 80 "$RUN_LOG" 2>/dev/null || echo "(不存在)"
     echo
+    echo "--- [14] 实时探测(本机回环, 节点运行中) ---"
+    probe_tcp "vless" "$PORT"
+    probe_tcp "vmess-ws" "$ARGO_LOCAL_PORT"
+    probe_ws
+    probe_reality
+    tuic_selftest
+    echo
+    echo "--- [15] UDP 间隔采样(60s, InErrors/RcvbufErrors 增量>0 = 内核丢包) ---"
+    echo "快照1: ${udp1:-?}"
+    sleep 60
+    echo "快照2: $(grep -A1 '^Udp:' /proc/net/snmp 2>/dev/null | tail -n1 || true)"
+    echo
     echo "=============================================================="
     echo " 报告结束: ${DIAG_TXT}"
     echo "=============================================================="
@@ -678,13 +697,15 @@ main() {
   echo "🌐 服务器 IP: ${ip}"
   generate_links "$ip"
   green "💾 [自举] 脚本/依赖/凭据均已落地 ${WORKDIR}; NAT 机免 crontab, 重启后执行: bash ${SELF_FILE}"
+  if [[ "${DIAG_MODE:-0}" == "1" ]]; then
+    ( collect_diag ) &
+  fi
   run_loop
 }
 
-# ========== 入口: --diag 只读诊断 / renew 全新部署 / 其余正常部署 ==========
+# ========== 入口: --diag 部署+诊断 / renew 全新部署 / 其余正常部署 ==========
 if [[ "${1:-}" == "--diag" || "${1:-}" == "diag" ]]; then
-  run_diag
-  exit 0
+  DIAG_MODE=1
 fi
 if [[ "${1:-}" == "renew" || "${1:-}" == "--renew" ]]; then
   renew_all
