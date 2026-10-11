@@ -42,11 +42,12 @@
 # 20261011-2223 feat: Argo 固定域名 — ARGO_AUTH 兼容 eyJ token/json 两种格式, 启动等待"Registered"确认并回报
 # 20261011-2257 feat: sb_argo.conf 配置文件 — 面板无法注入环境变量时 KEY=VALUE 落文件(环境变量优先), diag 掩码展示
 # 20261011-2334 fix: ARGO token 直传裸 payload(实测加 JWT 头反而 not valid); conf 值剥离 \r(兼容 CRLF 上传)
+# 20261011-2353 fix: token 模式参数顺序对齐 eooce 写法(全局参数须在 tunnel 与 run 之间, 否则 token 丢失秒退致 30s 循环重启); 云端回源端口自动适配并重建 vmess 入站
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-2334"
+SELF_VER="20261011-2353"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_FILE="${WORKDIR}/sb_argo.conf"   # 可选 KEY=VALUE 配置(面板不便传环境变量时用)
@@ -396,7 +397,8 @@ argo_start() {
   [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]] && token="$(argo_auth_token)"
   if [[ -n "$token" ]]; then
     echo "🌐 [Argo] 启动固定隧道(token): ${ARGO_DOMAIN}"
-    nohup "$CFD_BIN" tunnel run --token "$token" --no-autoupdate --logfile "$ARGO_LOG" --loglevel info >/dev/null 2>&1 &
+    nohup "$CFD_BIN" tunnel --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info \
+      run --token "$token" >/dev/null 2>&1 &
     echo $! > "$ARGO_PID_FILE"
     ARGO_HOST="$ARGO_DOMAIN"
     local i registered=""
@@ -407,6 +409,14 @@ argo_start() {
     done
     if [[ -n "$registered" ]]; then
       green "✅ [Argo] 固定隧道已注册: ${ARGO_DOMAIN} (pid $(cfd_pid), 日志: ${ARGO_LOG})"
+      # 云端托管隧道的回源端口以远程配置为准, 与本地不一致时自动适配(重建 vmess 入站)
+      local rport=""
+      rport="$(grep -oE 'localhost:[0-9]+' "$ARGO_LOG" 2>/dev/null | head -n1 | cut -d: -f2 || true)"
+      if [[ -n "$rport" && "$rport" != "$ARGO_LOCAL_PORT" ]]; then
+        echo "ℹ️  [Argo] 云端回源端口=${rport}(本地当前 ${ARGO_LOCAL_PORT}), 自动切换 vmess 入站到 ${rport}"
+        ARGO_LOCAL_PORT="$rport"
+        ARGO_PORT_CHANGED=1
+      fi
     else
       red "⚠️ [Argo] 30s 内未确认注册(查 ${ARGO_LOG}: token 是否有效/回源是否配 HTTP://localhost:8001)"
     fi
@@ -775,6 +785,10 @@ main() {
   generate_cert
   generate_config
   argo_start
+  if [[ "${ARGO_PORT_CHANGED:-0}" == "1" ]]; then
+    echo "📝 [配置] 按云端回源端口(${ARGO_LOCAL_PORT})重建 vmess 入站"
+    generate_config
+  fi
   argo_watch
   udp_monitor
   local ip; ip="$(get_server_ip)"
