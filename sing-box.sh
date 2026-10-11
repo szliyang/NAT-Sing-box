@@ -4,6 +4,7 @@
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
 # 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
+# 20261011-xxxx fix: NAT端口自动获取(PORT > PTERODACTYL_SERVER_PORT/SERVER_PORT > 随机), IP优先取翼龙注入变量
 # =========================
 
 export LANG=en_US.UTF-8
@@ -26,8 +27,21 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
-export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
-export CFIP=${CFIP:-'cdns.doon.eu.org'} 
+# ========== NAT端口自动获取 ==========
+# 优先级: PORT环境变量 > 翼龙(Pterodactyl)注入的SERVER_PORT > 随机
+detect_port() {
+    if [[ -n "${PORT:-}" ]]; then
+        echo "$PORT"
+    elif [[ -n "${PTERODACTYL_SERVER_PORT:-}" ]]; then
+        echo "$PTERODACTYL_SERVER_PORT"
+    elif [[ -n "${SERVER_PORT:-}" ]]; then
+        echo "$SERVER_PORT"
+    else
+        shuf -i 1000-65000 -n 1
+    fi
+}
+export vless_port=$(detect_port)
+export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
 
@@ -145,6 +159,15 @@ manage_packages() {
 
 # 获取ip
 get_realip() {
+    # NAT容器(翼龙)优先使用面板注入的IP，外网探测在NAT环境会拿到宿主出口IP
+    if [[ -n "${PTERODACTYL_SERVER_IP:-}" ]]; then
+        echo "$PTERODACTYL_SERVER_IP"
+        return
+    fi
+    if [[ -n "${SERVER_IP:-}" ]]; then
+        echo "$SERVER_IP"
+        return
+    fi
     ip=$(curl -4 -sm 2 ip.sb)
     ipv6() { curl -6 -sm 2 ip.sb; }
     if [ -z "$ip" ]; then
