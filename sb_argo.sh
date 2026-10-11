@@ -41,11 +41,12 @@
 # 20261011-1815 feat: 节点链接文件改名 00links.txt(与 00diag.txt 同前缀, 排序靠前便于下载查看)
 # 20261011-2223 feat: Argo 固定域名 — ARGO_AUTH 兼容 eyJ token/json 两种格式, 启动等待"Registered"确认并回报
 # 20261011-2257 feat: sb_argo.conf 配置文件 — 面板无法注入环境变量时 KEY=VALUE 落文件(环境变量优先), diag 掩码展示
+# 20261011-2334 fix: ARGO token 直传裸 payload(实测加 JWT 头反而 not valid); conf 值剥离 \r(兼容 CRLF 上传)
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-2257"
+SELF_VER="20261011-2334"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_FILE="${WORKDIR}/sb_argo.conf"   # 可选 KEY=VALUE 配置(面板不便传环境变量时用)
@@ -138,6 +139,7 @@ load_conf() {
     [[ "$line" != *=* ]] && continue
     k="$(echo "${line%%=*}" | tr -d '[:space:]')"
     v="${line#*=}"
+    v="${v%$'\r'}"                           # 兼容 Windows CRLF 上传
     [[ -z "$k" ]] && continue
     [[ -n "${!k:-}" ]] && continue          # 环境变量已存在则不覆盖
     export "$k=$v"
@@ -360,19 +362,20 @@ kill_stray_cfd() {  # 清理旧版本残留的无 pidfile 记录的 cloudflared
   done
 }
 
-# ARGO_AUTH 归一化: eyJ.. 原样返回; json(AccountTag/TunnelSecret/TunnelID) 转成 token; 无法识别返回空
+# ARGO_AUTH 归一化: eyJ.. payload 原样返回(实测 cloudflared 直收裸 payload, 勿加 JWT 头);
+# json(AccountTag/TunnelSecret/TunnelID) 转成裸 payload; 无法识别返回空
 argo_auth_token() {
   local auth="${ARGO_AUTH:-}"
+  auth="${auth%$'\r'}"
   case "$auth" in
     eyJ*) echo "$auth" ;;
     '{'*)
-      local acc tid sec payload
+      local acc tid sec
       acc="$(echo "$auth" | grep -oE '"AccountTag"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]*"$' | tr -d '"')"
       tid="$(echo "$auth" | grep -oE '"TunnelID"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]*"$' | tr -d '"')"
       sec="$(echo "$auth" | grep -oE '"TunnelSecret"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]*"$' | tr -d '"')"
       if [[ -z "$acc" || -z "$tid" || -z "$sec" ]]; then echo ""; return; fi
-      payload="$(printf '{"a":"%s","t":"%s","s":"%s"}' "$acc" "$tid" "$sec" | base64 | tr '/+' '_-' | tr -d '=\n')"
-      echo "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.${payload}." ;;
+      printf '{"a":"%s","t":"%s","s":"%s"}' "$acc" "$tid" "$sec" | base64 | tr '/+' '_-' | tr -d '=\n' ;;
     *) echo "" ;;
   esac
 }
