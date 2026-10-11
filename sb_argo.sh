@@ -9,6 +9,7 @@
 #   2) curl -Ls "https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh?t=$(date +%s)" | bash
 #   3) bash sb_argo.sh          # 自举落地后本地直接运行, 断网也能跑
 #   4) bash sb_argo.sh --diag   # 只读自检, 生成 sb-diag.txt 排查报告(不影响运行中的节点)
+#   5) bash sb_argo.sh renew    # 删旧配置全新开始(停旧进程+清凭据/配置/证书/链接/日志, 二进制保留)
 #
 # 自举(NAT 机免 crontab):
 #   - 脚本自身 + 依赖(sing-box/cloudflared) + 凭据 全部落地工作目录
@@ -22,11 +23,12 @@
 # 20261011-1705 fix: 多源下载(直连->ghproxy 镜像)防墙内自更新失败; 版本号 SELF_VER 落日志/diag; diag 增加 early-data 修复生效检测
 # 20261011-1724 fix: cloudflared 存活检测改 pidfile+kill -0(容器无 pgrep 曾致每 30s 误重启换域名); 自检 101 前缀匹配; diag 进程段改 /proc 扫描
 # 20261011-1727 feat: 启动时外部命令依赖自检(必需缺失即退出, 可选报告备选); seq 改 bash 内建循环; diag 增命令清单段
+# 20261011-1733 feat: renew 参数 — 停旧进程+清凭据/配置/证书/链接/日志, 全新部署(节点链接全部更换)
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-1727"
+SELF_VER="20261011-1733"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_JSON="${WORKDIR}/sb-argo.json"
@@ -371,6 +373,43 @@ argo_watch() {
   ) &
 }
 
+# ========== renew: 停旧进程 + 清全部配置文件, 全新开始 ==========
+kill_sb_instances() {  # 停掉旧脚本/sing-box/cloudflared/tee 进程(跳过本次 renew/diag 自身)
+  [[ -d /proc ]] || { echo "⚠️ [renew] 本机无 /proc, 跳过停进程(如有旧实例请手动停止)"; return 0; }
+  local p pid cmd
+  for p in /proc/[0-9]*/cmdline; do
+    pid="${p#/proc/}"
+    [[ "$pid" == "$$" ]] && continue
+    cmd="$(tr '\0' ' ' < "$p" 2>/dev/null || true)"
+    case "$cmd" in
+      *"$SB_BIN"*|*"$CFD_BIN"*|*sb_argo.sh*|*"/dev/fd/"*|*sb-run.log*)
+        case "$cmd" in
+          *renew*|*diag*) continue ;;
+        esac
+        echo "   ↪️ 停止 pid ${pid}: ${cmd}"
+        kill "$pid" 2>/dev/null || true
+        ;;
+    esac
+  done
+  sleep 1
+}
+
+renew_all() {
+  purple "♻️  [renew] 全新开始: 停止旧进程, 删除凭据/配置/证书/链接/日志 — 节点链接将全部更换"
+  kill_sb_instances
+  local f removed=0
+  for f in "$ENV_FILE" "$CONF_JSON" "$CERT_PEM" "$KEY_PEM" "$LINK_TXT" \
+           "$ARGO_LOG" "$ARGO_PID_FILE" "$RUN_LOG" "${RUN_LOG}.old" "$DIAG_TXT"; do
+    if [[ -e "$f" ]]; then
+      rm -f "$f"
+      echo "   🗑️  已删除 ${f}"
+      removed=1
+    fi
+  done
+  [[ $removed -eq 0 ]] && echo "   (无旧配置文件)"
+  green "✅ [renew] 清理完成, 二进制保留(sing-box/cloudflared 不重下), 即将全新部署"
+}
+
 # ========== 生成链接 ==========
 generate_links() {
   local ip="$1"
@@ -586,9 +625,12 @@ main() {
   run_loop
 }
 
-# ========== 入口: --diag 只读诊断, 其余正常部署 ==========
+# ========== 入口: --diag 只读诊断 / renew 全新部署 / 其余正常部署 ==========
 if [[ "${1:-}" == "--diag" || "${1:-}" == "diag" ]]; then
   run_diag
   exit 0
+fi
+if [[ "${1:-}" == "renew" || "${1:-}" == "--renew" ]]; then
+  renew_all
 fi
 main
