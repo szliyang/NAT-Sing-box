@@ -45,6 +45,19 @@ Argo 支持 `ARGO_AUTH`+`ARGO_DOMAIN`(固定域名 token) 或默认临时隧道(
 bash <(curl -Ls https://raw.githubusercontent.com/szliyang/NAT-sing-box/main/sb_argo.sh)
 ```
 
+### Argo 固定域名(免临时隧道每次重启换域名)
+1. 域名 DNS 托管到 Cloudflare(免费套餐即可);
+2. 打开 [Zero Trust](https://one.dash.cloudflare.com) → Networks → Tunnels → Create a tunnel(类型选 Cloudflared), 命名如 `sbargo`;
+3. 在安装页复制 token: 命令里 `--token` 后面那串 `eyJ...`;
+4. Public Hostname 页填: 子域名(如 `argo.example.com`) / Type=`HTTP` / URL=`localhost` / Port=`8001`;
+5. 部署时注入两个变量(面板 Startup 命令或环境变量):
+```
+ARGO_AUTH=eyJ... ARGO_DOMAIN=argo.example.com bash sb_argo.sh
+```
+`ARGO_AUTH` 也接受 json 格式 `{"AccountTag":..,"TunnelSecret":..,"TunnelID":..}`(脚本自动转 token)。
+固定域名模式下 vmess 链接永久稳定, 重启不再需要重新导入; 临时隧道模式每次重启域名会变。
+其他: `bash sb_argo.sh --diag` = 部署+运行+2 分钟后自动生成 `00diag.txt` 诊断报告; `bash sb_argo.sh renew` = 清空凭据全新开始; 节点链接固定读 `00links.txt`。
+
 
 ## ssh综合工具箱一键脚本
 ```

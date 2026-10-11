@@ -16,6 +16,13 @@
 #   - 凭据持久化在 sb_argo.env, 重启后复用, 节点链接不变
 #   - sing-box 前台 while-true 守护; cloudflared 后台循环守护, 挂掉自动重启并刷新链接
 #   - 容器/主机重启后执行: bash sb_argo.sh
+#
+# Argo 固定域名(可选, 免去临时隧道每次重启换域名):
+#   ARGO_AUTH: Cloudflare Zero Trust 隧道 token(eyJ..) 或 json {"AccountTag":..,"TunnelSecret":..,"TunnelID":..}
+#   ARGO_DOMAIN: 隧道公共主机名(如 argo.example.com); 回源 Service 填 HTTP://localhost:8001
+#   示例: ARGO_AUTH=eyJ.. ARGO_DOMAIN=argo.example.com bash sb_argo.sh
+#   步骤: 域名托管到 Cloudflare -> Zero Trust -> Networks/Tunnels -> 创建隧道(复制 token)
+#         -> Public Hostname 填子域名, Type=HTTP, URL=localhost, Port=8001
 # 20261011-xxxx init: 基于 sb 系列, 单端口布局(TCP+UDP 同号), vmess-ws 交 Argo 不占本地端口
 # 20261011-1602 feat: 自举 — 管道执行自动落地脚本+依赖, 凭据持久化复用(链接不变), cloudflared 纳入守护, verbose 输出
 # 20261011-1616 fix: vmess-ws 入站补 max_early_data/early_data_header_name(否则 ?ed=2048 客户端 bad request), 链接 scy=none 对齐 sb 系列
@@ -27,11 +34,12 @@
 # 20261011-1758 feat: tuic 诊断 — 本地回环自测(sing-box 自身当客户端), 后台每 60s 采样内核 UDP 计数/负载, diag 增 UDP 专检
 # 20261011-1810 feat: --diag 改为"部署+运行+自动采集"一条龙, 报告固定写 00diag.txt(启动约 2 分钟后生成, 节点持续运行)
 # 20261011-1815 feat: 节点链接文件改名 00links.txt(与 00diag.txt 同前缀, 排序靠前便于下载查看)
+# 20261011-2223 feat: Argo 固定域名 — ARGO_AUTH 兼容 eyJ token/json 两种格式, 启动等待"Registered"确认并回报
 # =========================================
 set -euo pipefail
 export LC_ALL=C
 
-SELF_VER="20261011-1815"
+SELF_VER="20261011-2223"
 WORKDIR="$(pwd)"                 # 管道执行时无脚本目录, 统一用当前目录
 SELF_FILE="${WORKDIR}/sb_argo.sh"
 CONF_JSON="${WORKDIR}/sb-argo.json"
@@ -324,6 +332,23 @@ kill_stray_cfd() {  # 清理旧版本残留的无 pidfile 记录的 cloudflared
   done
 }
 
+# ARGO_AUTH 归一化: eyJ.. 原样返回; json(AccountTag/TunnelSecret/TunnelID) 转成 token; 无法识别返回空
+argo_auth_token() {
+  local auth="${ARGO_AUTH:-}"
+  case "$auth" in
+    eyJ*) echo "$auth" ;;
+    '{'*)
+      local acc tid sec payload
+      acc="$(echo "$auth" | grep -oE '"AccountTag"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]*"$' | tr -d '"')"
+      tid="$(echo "$auth" | grep -oE '"TunnelID"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]*"$' | tr -d '"')"
+      sec="$(echo "$auth" | grep -oE '"TunnelSecret"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '"[^"]*"$' | tr -d '"')"
+      if [[ -z "$acc" || -z "$tid" || -z "$sec" ]]; then echo ""; return; fi
+      payload="$(printf '{"a":"%s","t":"%s","s":"%s"}' "$acc" "$tid" "$sec" | base64 | tr '/+' '_-' | tr -d '=\n')"
+      echo "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.${payload}." ;;
+    *) echo "" ;;
+  esac
+}
+
 argo_start() {
   if [[ -z "$CFD_BIN" ]]; then
     ARGO_HOST="argodomain.pending"
@@ -336,28 +361,49 @@ argo_start() {
   fi
   kill_stray_cfd
   rm -f "$ARGO_LOG"                       # 清旧日志, 避免取到上次的临时域名
-  if [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]]; then
+  local token=""
+  [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]] && token="$(argo_auth_token)"
+  if [[ -n "$token" ]]; then
     echo "🌐 [Argo] 启动固定隧道(token): ${ARGO_DOMAIN}"
-    nohup "$CFD_BIN" tunnel run --token "$ARGO_AUTH" --logfile "$ARGO_LOG" >/dev/null 2>&1 &
+    nohup "$CFD_BIN" tunnel run --token "$token" --no-autoupdate --logfile "$ARGO_LOG" --loglevel info >/dev/null 2>&1 &
     echo $! > "$ARGO_PID_FILE"
     ARGO_HOST="$ARGO_DOMAIN"
-  else
-    echo "🌐 [Argo] 启动临时隧道: 127.0.0.1:${ARGO_LOCAL_PORT} -> trycloudflare.com"
-    nohup "$CFD_BIN" tunnel --url "http://127.0.0.1:${ARGO_LOCAL_PORT}" \
-      --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info >/dev/null 2>&1 &
-    echo $! > "$ARGO_PID_FILE"
-    local i
+    local i registered=""
     for ((i = 1; i <= 30; i++)); do
-      ARGO_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | head -n1 | sed 's#https://##' || true)"
-      [[ -n "$ARGO_HOST" ]] && break
+      registered="$(grep -o 'Registered tunnel connection' "$ARGO_LOG" 2>/dev/null | head -n1 || true)"
+      [[ -n "$registered" ]] && break
       sleep 1
     done
-  fi
-  if [[ -n "${ARGO_HOST:-}" ]]; then
-    green "✅ [Argo] 隧道已启动: ${ARGO_HOST} (pid $(cfd_pid), 日志: ${ARGO_LOG})"
+    if [[ -n "$registered" ]]; then
+      green "✅ [Argo] 固定隧道已注册: ${ARGO_DOMAIN} (pid $(cfd_pid), 日志: ${ARGO_LOG})"
+    else
+      red "⚠️ [Argo] 30s 内未确认注册(查 ${ARGO_LOG}: token 是否有效/回源是否配 HTTP://localhost:8001)"
+    fi
+  elif [[ -n "${ARGO_AUTH:-}" && -n "${ARGO_DOMAIN:-}" ]]; then
+    red "⚠️ [Argo] ARGO_AUTH 无法识别(需 eyJ.. token 或含 AccountTag/TunnelSecret/TunnelID 的 json), 回退临时隧道"
+    argo_temp_start
   else
+    argo_temp_start
+  fi
+  if [[ -z "${ARGO_HOST:-}" ]]; then
     red "⚠️ [Argo] 域名获取失败(不影响 vless/tuic), 可查看 ${ARGO_LOG}"
     ARGO_HOST="argodomain.pending"
+  fi
+}
+
+argo_temp_start() {
+  echo "🌐 [Argo] 启动临时隧道: 127.0.0.1:${ARGO_LOCAL_PORT} -> trycloudflare.com"
+  nohup "$CFD_BIN" tunnel --url "http://127.0.0.1:${ARGO_LOCAL_PORT}" \
+    --no-autoupdate --protocol http2 --logfile "$ARGO_LOG" --loglevel info >/dev/null 2>&1 &
+  echo $! > "$ARGO_PID_FILE"
+  local i
+  for ((i = 1; i <= 30; i++)); do
+    ARGO_HOST="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | head -n1 | sed 's#https://##' || true)"
+    [[ -n "$ARGO_HOST" ]] && break
+    sleep 1
+  done
+  if [[ -n "${ARGO_HOST:-}" ]]; then
+    green "✅ [Argo] 临时隧道已启动: ${ARGO_HOST} (pid $(cfd_pid), 日志: ${ARGO_LOG})"
   fi
 }
 
