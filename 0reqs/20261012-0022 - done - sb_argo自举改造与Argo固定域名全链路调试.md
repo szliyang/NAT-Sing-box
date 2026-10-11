@@ -40,12 +40,24 @@
 
 配套: README 增固定域名配置指南与双隧道说明。
 
-## 四、验证方式
+## 四、一条命令生成 argo 固定域名配置文件(demo)
+
+```bash
+printf 'ARGO_DOMAIN=argo.example.com\nARGO_AUTH=eyJ你的token\n' > /home/container/sb_argo.conf
+```
+
+掩码校验(不泄露 token):
+
+```bash
+sed 's/\(=.\{8\}\).*/\1.../' /home/container/sb_argo.conf
+```
+
+## 五、验证方式
 
 - 本地 mock 环境(curl/tar/sing-box/cloudflared 全桩)覆盖: 首次部署/重启复用/断网回退/崩溃守护/renew/CRLF conf/json 转换/双隧道
 - 真实工具实测: 本机 sing-box(1.10.7 与 v2rayN 自带 1.13.18)直连测 tuic; 真实 cloudflared 验证 token 格式、参数顺序、云端回源配置、argotk 域名端到端穿透(本地 44020 取回内容)
 
-## 五、遗留事项
+## 六、遗留事项
 
 - 固定域名速度可能逊于临时隧道, 已双链接并存供选择; 长期建议自有域名自建隧道
 - tuic 直连受运营商 UDP QoS 影响属链路问题, 客户端走中转即可
